@@ -1091,6 +1091,47 @@ Hai điều chưa tốt, đo được từ cùng lượt này:
    (tức các máy mới) **không** có fast transition, còn client WPA2-PSK thì có FT-PSK. Đây là việc
    đáng làm tiếp nếu muốn roaming mượt.
 
+### Bật FT-SAE thật, và netifd tự lo khoá
+
+Chỗ thiếu ở trên (`ft_psk_generate_local=1` chỉ hợp lệ cho FT-PSK) sửa bằng **một** option, không
+cần sinh khoá bí mật nào. Đọc `/lib/netifd/hostapd.sh`: khi `ft_psk_generate_local=0` mà không
+khai `r0kh`/`r1kh`, netifd **dẫn xuất** khoá FT bằng
+
+```sh
+ft_key=$(echo -n "$mobility_domain/${auth_secret:-${key}}" | md5sum | awk '{print $1}')
+r0kh=ff:ff:ff:ff:ff:ff,*,$ft_key          # nhận PMK-R0 từ bất kỳ NAS id nào
+r1kh=00:00:00:00:00:00,00:00:00:00:00:00,$ft_key
+```
+
+Hai AP cùng `mobility_domain` và cùng khoá SSID thì ra **cùng** `ft_key`, nên chỉ cần đặt giống
+nhau trên cả hai máy là xong. Đã đặt cho SSID chính (`default_radio1`) trên cả hai:
+
+```
+uci set wireless.default_radio1.ft_psk_generate_local='0'
+uci set wireless.default_radio1.nasid='<mac của w-lan, bỏ dấu hai chấm>'   # mỗi máy một giá trị
+uci set wireless.default_radio1.pmk_r1_push='0'                            # pull khi cần
+```
+
+`nasid` là bắt buộc: không có nó thì netifd không ghi `nas_identifier`, mà đó chính là R0KH-ID.
+Kiểm sau `wifi reload`: hai conf có **cùng** `r0kh`/`r1kh` key (md5 giống nhau từng ký tự) và
+`nas_identifier` **khác** nhau — đúng yêu cầu. hostapd thay BSS gọn gàng
+(`bss w-lan changed in ft_psk_generate_local, nas_identifier, r0kh, r1kh, pmk_r1_push, replacing
+it`), client rớt một nhịp rồi vào lại. Lưu ý: khoá này không phải thứ mình chọn nên không có gì
+để lưu riêng, nhưng nó **đổi theo khoá SSID**: đổi mật khẩu Wi-Fi là FT tự khớp lại trên cả hai.
+
+SSID khách chưa bật `ieee80211r` nên chưa có FT; để dành.
+
+Cùng lúc, siết usteer một bậc sau khi thấy client đu tới −88 dBm mới nhả:
+
+```
+uci set usteer.@usteer[0].roam_trigger_snr='-68'
+uci set usteer.@usteer[0].aggressiveness='2'   # thêm "disassociation imminent"
+```
+
+Backup trước khi sửa: `/root/pre-sync-20261106/wireless.before-ftsae` và `usteer.before-tighten`
+trên cả hai máy. Việc còn lại: đi vòng lần nữa và xem hostapd của AP đích báo `auth_alg=ft`
+thay vì `sae` — đó mới là bằng chứng FT chạy.
+
 ## Việc còn lại
 
 - ~~PR 50: chạy ngắn cùng commit không profile để so `Frame OOR`, `Overflow`,
