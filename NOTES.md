@@ -1327,10 +1327,9 @@ ip link set eth0 up   -> phys_if 0 waits for link before the NSS fw data plane
 mọi đường thất bại đều in `host RX rings not restored`. Không có dòng đó, mà sau đó
 `dev_close`/`dev_open` của glue vẫn chạy sạch và firmware resume đúng ring đã lưu.
 
-Cộng dồn cả hai vòng: bản mesh (không page_owner) 35,8 MiB → vòng 2 đo 41,2 MiB *vẫn còn*
-page_owner ngốn ~4,5 MiB, tức khoảng **45,7 MiB** nếu bỏ page_owner — hơn bản mesh gần **10 MiB**,
-khớp với 4,1 (999-998) + 2 (BPF JIT) + 4,0 (vòng 2). Việc kế tiếp là build bản **không**
-page_owner để lấy con số thật.
+(Đính chính đơn vị: 41220 kB = **40,3 MiB**, không phải "41,2 MiB" — chỗ này tôi đã viết lẫn kB
+thành MiB một lần.) Vòng 2 vẫn còn page_owner ngốn ~5 MiB, nên con số thật phải đo bằng bản
+không page_owner — xem bảng tổng ở cuối mục này.
 
 Nhắc lại cái bẫy `keep.d`: sau lần flash này `/root` của máy thứ nhất trống trơn, `memlong.sh`
 mất theo. Đã copy lại (md5 `5d46cf13...`, khớp bản trong `tools/router-monitor/`) và chạy lại
@@ -1354,10 +1353,33 @@ có; `.config` của ảnh: `# CONFIG_PAGE_OWNER is not set`, `# CONFIG_PAGE_EXT
 `host RX rings not restored` vẫn có trong `vmlinux`, tức code vòng 2 nằm trong ảnh. Ảnh ở
 `images-nopo-<commit>/`.
 
-Đây là **bản đầu tiên không còn knob debug nào**, nên nó cũng là ứng viên để làm release. Nạp
-thì sẽ vào **slot 1**, tức ghi đè `ram-round1`; đường về sau đó là slot 0 (vòng 2 + page_owner,
-đang chạy ổn). Đo cần làm sau khi nạp: `MemAvailable` lúc nghỉ không client, so với 35,8 MiB của
-bản mesh và 41,2 MiB của vòng 2 có page_owner — dự kiến quanh **45,7 MiB**.
+Đây là **bản đầu tiên không còn knob debug nào**, nên nó cũng là ứng viên để làm release.
+
+Đã nạp vào **slot 1** máy thứ nhất 2026-11-07 00:18 (`r38369+5-0ee7daae5b`; số commit nhỏ hơn
+bản trước đúng 1 vì đã bỏ commit page_owner), ghi đè `ram-round1`; **đường về giờ là slot 0** =
+vòng 2 + page_owner, bản đã chạy ổn từ tối trước
+(`fw_setenv flag_last_success 0; fw_setenv flag_boot_rootfs 0; reboot`). Backup config trước khi
+nạp nằm trong `private-backups/`.
+
+### Bảng tổng: RAM lấy lại được, đo cùng một script ở cùng mốc ~1 phút sau boot
+
+| bản | MemAvailable | so với bản mesh |
+|---|---|---|
+| mesh (mục 17) — không patch nào, BPF JIT bật, ring RX host giữ nguyên | 35744 kB | — |
+| vòng 1 (999-998 + tắt BPF JIT) **+ page_owner** | 37188 kB | +1,41 MiB |
+| vòng 2 (+ trả buffer RX) **+ page_owner** | 41220 kB | +5,35 MiB |
+| **vòng 2, bỏ page_owner** | **46224 kB** | **+10,23 MiB** |
+
+Ba con số chênh nhau đúng như thiết kế: vòng 2 hơn vòng 1 **4032 kB** (≈ 4 MiB page pool RX của
+hai GMAC), và bỏ page_owner lấy thêm **5004 kB** (`page_ext` + stackdepot). Tổng **10,23 MiB**
+khớp gần như tuyệt đối với dự đoán 4,1 (999-998) + 2 (BPF JIT) + 4,0 (vòng 2) = 10,1 MiB.
+
+Kiểm sau khi nạp: `qca-dwmac: data plane claimed` cho cả hai GMAC, **không** có
+`host RX rings not restored`; `/sys/kernel/debug/page_owner_stacks` **không tồn tại** (đúng, đã
+tắt); ba SSID lên; `NSS offload` active; VLAN 68/6/7 đủ. Lúc đo không có client nào trên máy
+(reboot đẩy hết sang máy thứ hai) nên **46292 kB** đo lại sau đó là số lúc nghỉ thật.
+
+`memlong.sh` lại mất theo flash (`keep.d`) — đã copy lại và chạy lại.
 
 ### Biết client đang nối máy nào, khi hai máy chung SSID
 
