@@ -747,6 +747,50 @@ trong runtime (file bị uci ghi lại và mất comment — init của ECM comm
 trong cây ghi `conduit`; chỉ `netifd` đọc `network_device` của `board.json`, mà board.d đặt mọi cổng
 = `eth1`. Cần xem lại ở lần reboot sau.
 
+### Dựng thật một link 802.11s và đo
+
+Cả hai AP đều nối dây với nhau (trunk), nên mesh **không** bridge vào `br-lan`: bridge mà không
+bật STP là tạo vòng lặp lớp 2 cho cả LAN. Cấu hình đã dùng: một `wifi-iface` `mode mesh` trên
+radio0 (2.4 GHz, hai AP vốn đã cùng kênh 1 — hai đầu mesh buộc phải cùng kênh), `encryption sae`,
+netdev mesh mang một /24 riêng và một zone firewall riêng (input ACCEPT, forward REJECT).
+Script: `tools/mesh-setup.sh <ip> <mesh-ip>` (khoá SAE truyền qua stdin, không nằm trong argv).
+
+NSS mesh offload **có chạy** — lần đầu đo được trên board này (Kconfig chỉ ghi đã đo trên
+GL-B3000 và Archer AX55), với profile 256 MiB và firmware NSS 12.5:
+
+```
+nss_wifi_meshmgr_init_module: Module Build Id ... loaded
+nss_wifi_meshmgr_if_create_sync: Successfully registered encap and decap iface for Mesh
+nss_wifi_meshmgr_if_create_sync: WiFi Mesh interface count:1
+wpa_supplicant[w-mesh]: MESH-PEER-CONNECTED   (SAE, -42..-49 dBm)
+```
+
+- `iw station dump` của peer: **HE-MCS5 NSS2 40 MHz = 275,2 Mbit/s** PHY, tx retries 0, tx failed 0.
+- `iw mpath dump` rỗng dù ping chạy — khớp với việc bảng mesh path nằm dưới NSS, không ở host.
+- Thông lượng, traffic **kết thúc trên router** (iperf3 giữa hai AP): TCP 1 luồng 9,4 Mbit/s,
+  4 luồng 10,2, chiều về 16,5; UDP ép 100 Mbit nhận 17,9 Mbit/s mất 7,9%. Trong khi đó kênh 1
+  `busy 72%` (111429/153923 ms) vì cả hai AP cùng phát 2.4 GHz trên ch1 cộng client IoT.
+  Chưa tách được phần do contention với phần do thiếu aggregation trên link mesh / đường
+  exception về host. Muốn số thật của một backhaul thì phải đo traffic **đi xuyên** (client sau
+  AP này tới host sau AP kia), và nếu cần backhaul nhanh thì phải chuyển mesh sang 5 GHz, tức
+  đưa hai AP về cùng một kênh 5 GHz (hiện cố ý tách ch36/ch100 cho roaming).
+- Giá RAM của mesh khi chạy: MemAvailable 35,7 -> 32,8 MiB ở máy thứ nhất, 35,1 -> 32,4 ở máy thứ hai.
+
+Cùng lần này: đổi SSID của máy thứ nhất cho trùng máy thứ hai (khoá vốn đã trùng) để có roaming
+thật; 802.11r sẵn trong `wpad-mesh-mbedtls`, `usteer` cài sẵn nhưng **chưa bật**.
+
+Hai điều rút ra khi sửa Wi-Fi qua ssh:
+
+1. `wifi reload` trên board này có thể lâu hơn 60 s. Đặt timeout ssh ngắn thì lệnh bị kill giữa
+   lúc reload.
+2. Sau `uci commit wireless` (chỉ đổi 3 SSID), một section `wifi-iface` đang có trong file biến
+   mất — chưa rõ cơ chế. Nên sao lưu `/etc/config/wireless` trước khi commit, và kiểm lại số
+   section sau đó. (Dựng lại được từ tarball `sysupgrade -b` của cùng ngày.)
+
+Thêm một dữ kiện cho câu hỏi conduit ở trên: máy thứ nhất **giữ** `conduit 'eth0'` qua reboot sau
+khi nạp lại (config đi bằng `sysupgrade -b`), nên cú đổi sang `eth1` ở máy thứ hai nghiêng về
+"chỉ xảy ra ở lần first boot có restore tarball tự đóng".
+
 ## Việc còn lại
 
 - PR 50: bản mục 12 đã soak 17,8 h (log lưu local). Còn chạy ngắn cùng commit không profile
@@ -757,8 +801,9 @@ trong cây ghi `conduit`; chỉ `netifd` đọc `network_device` của `board.js
   (memlong 10 phút ghi `pdr2`/`pdr5`); còn phải xem có đi kèm sự cố nào, và so với bản không
   NSS Wi-Fi offload. Đã loại trừ việc rút điện/di dời: bộ đếm nằm trong phiên firmware nên mỗi
   lần boot nó về 0, mà 25 lần đó tích trong một phiên uptime liền 5 ngày 16 h.
-- ~~Thử `CONFIG_ATH11K_NSS_MESH_SUPPORT`~~ — bật và build xong ở mục 17, đã chạy trên máy
-  thứ hai. Còn phải **cấu hình thử một link 802.11s** và đo RAM khi mesh hoạt động thật.
+- ~~Thử `CONFIG_ATH11K_NSS_MESH_SUPPORT`~~ — xong ở mục 17: build, nạp cho cả hai AP, dựng link
+  802.11s thật, NSS mesh offload tạo được interface. Còn lại: đo thông lượng bằng traffic đi
+  xuyên (không kết thúc trên router), và thử mesh trên 5 GHz nếu cần backhaul nhanh.
 - ~~Thêm `usteer`~~ — đã có trong bản mục 17 (chưa bật, chưa cấu hình; `luci-app-usteer` vẫn
   chưa thêm). 802.11r sẵn trong `wpad-mesh-mbedtls` như cũ.
 - Script chuyển cấu hình từ bản hzyitc (swconfig, OpenWrt 23.05.3) sang bản DSA này:
