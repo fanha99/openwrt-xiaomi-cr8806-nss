@@ -976,6 +976,64 @@ Hai cái bẫy gặp trong lúc test:
 Trạng thái: nhánh đã push lên fork, **chưa build** (logic đã chứng minh xong, chỉ cần build khi
 nào flash). md5 `functions.sh`: bản đang chạy `6cb4749c…`, bản sửa `9c4c6f2e…`.
 
+## 19. usteer: hoá ra nó đã chạy, nhưng không steer gì cả
+
+Mục 17 và "Việc còn lại" trước đây ghi usteer "chưa bật, chưa cấu hình". **Sai**: gói usteer
+bật service mặc định, nên `usteerd` đã chạy trên cả hai AP từ lúc nạp bản mục 17, với
+`/etc/config/usteer` nguyên bản của gói (chỉ đặt `network lan`, `syslog 1`, `local_mode 0`,
+`debug_level 2`; mọi thứ khác để comment = mặc định của daemon).
+
+Những gì nó **đang** làm, kiểm bằng ubus:
+
+- Hai AP thấy nhau: `ubus call usteer remote_hosts` trên mỗi máy trả về đúng máy kia.
+  Giao tiếp đi qua `br-lan.68` (uci `option network lan`), UDP 16720.
+- `ubus call usteer local_info` liệt kê cả ba BSS mỗi máy kèm `rrm_nr` — tức usteer đang cấp
+  danh sách neighbor 802.11k cho hostapd. Đây là phần có ích nhất và nó miễn phí.
+- `ubus call usteer get_clients` cho **góc nhìn chéo**: với một client, máy thứ hai có cả số đo
+  của chính nó (`hostapd.<bss>`) lẫn số đo máy thứ nhất nghe được (`<ip máy kia>#hostapd.<bss>`).
+  Ví dụ thực tế: một client ở −65 dBm trên AP đang nối, mà AP kia chỉ nghe −90 dBm.
+
+Những gì nó **không** làm — và đây là điểm dễ tưởng sai: `roam_events` của mọi BSS trên cả hai
+máy đều `source 0, target 0`, nghĩa là chưa từng có một lần steering nào. Đọc source
+(usteer 2026-05-19, `policy.c`) thì rõ vì sao, cả hai đều do giá trị mặc định `0`:
+
+```c
+better_signal_strength(...)  { if (!config.signal_diff_threshold) return false; ... }
+usteer_local_node_roam_check(...) {
+	if (config.roam_scan_snr) ... else if (config.roam_trigger_snr) ... else return;
+}
+```
+
+- `signal_diff_threshold 0` → hàm "AP kia tốt hơn" **luôn** trả false.
+- `roam_scan_snr 0` **và** `roam_trigger_snr 0` → máy trạng thái roam return ngay, không bao giờ
+  gửi roam scan, không BSS transition request, không kick.
+- `min_snr 0`, `assoc_steering 0`, `load_kick_enabled 0` → không đuổi ai vì tín hiệu yếu, không
+  từ chối association, không kick vì tải kênh.
+
+Nói cách khác: mặc định của usteer là **chỉ chia sẻ trạng thái + cấp neighbor report**, hoàn toàn
+thụ động. Muốn nó thật sự điều hướng thì phải tự đặt ngưỡng.
+
+Một cái bẫy về đơn vị, đọc `usteer_snr_to_signal()` mới thấy: giá trị **âm** được dùng làm mức
+tín hiệu tuyệt đối (dBm), giá trị **dương** được coi là SNR và cộng vào `noise` mà node báo. Trên
+board này `noise` báo −116 / −113 dBm, nên để SNR dương sẽ ra ngưỡng vô nghĩa (SNR 20 → −96 dBm).
+**Luôn dùng số âm.**
+
+Đã bật mức nhẹ nhất trên cả hai máy (backup `/root/pre-sync-20261106/usteer.before-steering`):
+
+```
+uci set usteer.@usteer[0].roam_trigger_snr='-72'      # chỉ xét client yếu hơn -72 dBm
+uci set usteer.@usteer[0].signal_diff_threshold='8'   # chỉ chuyển nếu AP kia hơn >= 8 dB
+uci set usteer.@usteer[0].aggressiveness='1'          # BSS transition request thụ động, không
+                                                      # disassoc imminent, không kick
+```
+
+Giữ nguyên `min_snr 0`, `assoc_steering 0`, `load_kick_enabled 0`, và **không** đặt `ssid_list`:
+`usteer_check_node_enabled()` tắt hẳn node nào có SSID ngoài danh sách, nên đặt nó sẽ mất luôn
+neighbor report của các SSID còn lại. `signal_diff_threshold 8` là cái chống ping-pong.
+
+Còn lại là phép thử đi vòng (cần người): mang laptop/điện thoại đi từ AP này sang AP kia, rồi xem
+`roam_events` có nhảy không và client có dính AP xa không.
+
 ## Việc còn lại
 
 - ~~PR 50: chạy ngắn cùng commit không profile để so `Frame OOR`, `Overflow`,
@@ -1001,14 +1059,12 @@ nào flash). md5 `functions.sh`: bản đang chạy `6cb4749c…`, bản sửa `
   hostapd có `FT` reassociation hay không, client có dính AP xa không, và quyết định có cần
   `usteer` không. Bản build vẫn mang `wpad-mesh-mbedtls` + `CONFIG_ATH11K_NSS_MESH_SUPPORT`
   (tốn ~262 KB ảnh, 28 KB module); không gỡ, để dành đường thử lại sau.
-- ~~Thêm `usteer`~~ — đã có trong bản mục 17 (chưa bật, chưa cấu hình; `luci-app-usteer` vẫn
-  chưa thêm). 802.11r sẵn trong `wpad-mesh-mbedtls` như cũ. Nói rõ cho khỏi lẫn: `usteer`
-  **không** liên quan gì đến mesh. Nó là daemon điều hướng client giữa nhiều AP: các AP nói
-  chuyện với nhau qua LAN (UDP 16720) để so mức tín hiệu của cùng một client rồi chủ động đẩy
-  client sang AP tốt hơn (802.11v BSS transition, hoặc từ chối/đuổi association). Backhaul là
-  dây hay vô tuyến không quan trọng — với backhaul dây như hiện tại nó còn đúng việc hơn.
-  802.11r/k/v hiện tại chỉ làm cho việc *chuyển* nhanh và có dữ liệu để client tự quyết; usteer
-  là phần *quyết định thay client*. Tuỳ chọn, không bắt buộc.
+- ~~Thêm `usteer`~~ — xem **mục 19**: nó đã tự chạy sẵn trên cả hai AP (mặc định của gói bật
+  service), chỉ là không steer gì vì mọi ngưỡng mặc định bằng 0; đã bật mức nhẹ nhất ngày
+  2026-11-06. Còn lại: phép thử đi vòng, rồi quyết định có nâng `aggressiveness` không.
+  `luci-app-usteer` vẫn chưa thêm. 802.11r sẵn trong `wpad-mesh-mbedtls` như cũ, và usteer
+  **không** liên quan gì đến mesh — nó điều hướng client giữa các AP qua LAN, backhaul dây hay
+  vô tuyến đều dùng được.
 - ~~Script chuyển cấu hình từ bản hzyitc (swconfig, OpenWrt 23.05.3) sang bản DSA này~~ —
   `Convert-HzyitcConfig.ps1` đã kiểm bằng một backup thật, kết quả đã chạy trên máy thứ hai
   (xem mục 17), và nay đã commit vào `tools/hzyitc2nss/` của branch này. Còn lại: nếu muốn ai
