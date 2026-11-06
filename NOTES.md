@@ -1132,6 +1132,50 @@ Backup trước khi sửa: `/root/pre-sync-20261106/wireless.before-ftsae` và `
 trên cả hai máy. Việc còn lại: đi vòng lần nữa và xem hostapd của AP đích báo `auth_alg=ft`
 thay vì `sae` — đó mới là bằng chứng FT chạy.
 
+## 20. Vòng 1 tiết kiệm RAM: 999-998 + tắt BPF JIT, đo bằng page_owner
+
+Nhánh `ram-round1` = bản đang chạy (`main` + 2 commit test DSA) + ba commit: 999-998 (mục 10),
+`DEBUG: enable page_owner` (mục 3), và `TEST: tắt CONFIG_BPF_JIT` cho subtarget ipq50xx. Nạp vào
+**slot 1** của máy thứ nhất, giữ config; **slot 0** còn bản mesh làm đường về. Kiểm trong kernel
+config của ảnh: `# CONFIG_BPF_JIT is not set`, `CONFIG_PAGE_OWNER=y`, và `page_owner=on` có trong
+ảnh. Phiên bản báo `r38369+5-0ee7daae5b`.
+
+Đo lúc nghỉ, uptime 2 phút, không client Wi-Fi (`page_owner_stacks/show_stacks`, tổng 112,4 MiB
+trong 486 stack):
+
+| nhóm | lần này | đối chiếu |
+|---|---|---|
+| `ath11k_dp_link_desc_setup` (link descriptor) | **4,01 MiB** | 8,1 MiB ở mục 5 (không có 999-998); 4,07 MiB ở mục 10 (có) |
+| mọi stack có chữ `bpf` | **5 trang = 20 KiB** | mục 10: vùng `bpf_prog_pack` **2 MiB** |
+| `ath11k_ce_cleanup_pipes` (buffer CE, 999-997) | 1,38 + 1,34 + 0,62 ≈ **3,3 MiB** | 4,3 MiB ở mục 10, 17,9 MiB ở mục 5 |
+| `nss_core_send_cmd` (payload pool NSS) | 15,30 MiB | 14,3-14,4 MiB ở mục 5/10 |
+| `arch_execmem_alloc <- load_module` | 4,91 MiB | — (module kernel, không phải BPF) |
+| MemAvailable | 36,9 MiB (gồm ~4,5 MiB `page_ext`) | bản mesh cùng máy, cùng mốc sau boot: 35,8 MiB |
+
+Kết luận: **999-998 làm đúng việc** (4 MiB cho cả hai radio thay vì 8, tức 2 MiB mỗi radio), và
+**tắt BPF JIT lấy lại đúng ~2 MiB**. Trừ ~4,5 MiB overhead của page_owner thì bản này hơn bản
+mesh khoảng 5,6 MiB — khớp với dự đoán 4,1 + 2 MiB.
+
+Một cái bẫy khi kiểm BPF: `/proc/vmallocinfo` **không** cho thấy vùng pack đó. Trên cả hai máy
+(một bật JIT, một tắt) nó chỉ có đúng một dòng `bpf_prog_alloc_no_stats` 8 KiB. Phải dùng
+page_owner mới thấy, nên đừng kết luận bằng vmallocinfo.
+
+**Mục tiêu của vòng 2 hiện ra ngay trong cùng bảng** — hai stack, mỗi stack đúng 2,00 MiB:
+
+```
+2.00 MiB  512 pages  __page_pool_alloc_netmems_slow <- __init_dma_rx_desc_rings <- init_dma_desc_rings
+                     <- stmmac_setup_dma_desc <- stmmac_open <- __dev_open
+2.00 MiB  512 pages  __page_pool_alloc_netmems_slow <- __init_dma_rx_desc_rings <- init_dma_desc_rings
+                     <- stmmac_setup_dma_desc <- stmmac_change_mtu <- netif_set_mtu_ext
+```
+
+Tức **4,00 MiB** page pool RX của hai GMAC, đúng bằng con số mục 9 suy ra từ việc đọc code, mà
+firmware NSS đang nắm data plane nên hai ring này không nhận một gói nào. (Chi tiết nhỏ: một GMAC
+được cấp qua `stmmac_open`, GMAC kia qua `stmmac_change_mtu` — lúc boot có thứ đổi MTU của nó.)
+
+Sức khoẻ sau khi nạp: `eth0` 1000Mb/s link detected yes (patch 714 vẫn làm việc), `fw_mask` 0x3,
+ba SSID lên, `NSS offload: active`, firmware `NSS.FW.12.5-210-MP.R`, VLAN 68/6/7 đủ.
+
 ## Việc còn lại
 
 - ~~PR 50: chạy ngắn cùng commit không profile để so `Frame OOR`, `Overflow`,
@@ -1172,7 +1216,8 @@ thay vì `sae` — đó mới là bằng chứng FT chạy.
   theo số đo ở đính chính lần hai. Còn lại: theo phản hồi reviewer, nhờ người có Redmi AX5400 /
   PZ-L8 kiểm chứng, và gửi bản `[PATCH net-next]` lên netdev. PR bỏ hook vào
   kuncy7/openwrt-nss-edma **hoãn** tới khi patch vào được `c3po-tag-8021q`.
-- 999-998: thử nhiều client (điện thoại, laptop, IoT) để chắc 16384 link descriptor đủ.
+- 999-998: đã đo lại ở **mục 20** (4,01 MiB cho cả hai radio, đúng như thiết kế). Còn lại:
+  thử nhiều client (điện thoại, laptop, IoT) để chắc 16384 link descriptor đủ.
   **Lưu ý quan trọng (kiểm 2026-11-06)**: patch này chỉ có trên nhánh `testing`, **không** có
   trong bản đang chạy. Hai máy đang chạy `main` + 2 commit test DSA (`2a54850797`); log build
   cho thấy 999-990…997 đều được apply, **999-998 thì không**. Nghĩa là hai AP hiện dùng kích
