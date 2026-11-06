@@ -1429,7 +1429,7 @@ của khoá chứ không in khoá).
 | mesh | **0 wifi-iface nào `mode='mesh'`** trên cả hai → đúng quyết định chỉ dùng dây | — |
 | kênh | 2.4 GHz: **cả hai đều kênh 1** | 5 GHz: 36 / 100 |
 
-### Ba điểm hở tìm thấy
+### Ba điểm hở tìm thấy — hai cái đầu đã vá ngay (2026-11-07)
 
 1. **SSID IoT (2.4 GHz) và SSID khách không có 802.11k/v.** usteer vì thế gần như **không điều
    hướng được** client ở hai SSID đó: nó cần `rrm_nr` (11k) để gợi ý AP đích và
@@ -1442,6 +1442,36 @@ của khoá chứ không in khoá).
 3. **`ft_over_ds=0`** trong conf đang chạy, tức FT chỉ đi over-the-air. Đây **không** phải
    nguyên nhân FT đang hỏng (nguyên nhân là thiếu PMK-R0, mục 19), nhưng nếu sau này sửa được FT
    thì có thể bật để roam ở vùng biên nhanh hơn.
+
+### Đã vá: 802.11k/v cho IoT + khách, và tách kênh 2.4 GHz
+
+Áp dụng trên **cả hai máy** (script chạy tách bằng `start-stop-daemon`, backup
+`/root/pre-sync-20261107/wireless.before-kv`, và tự `cp` lại backup + `wifi reload` nếu không đủ
+3 SSID lên lại):
+
+```
+uci set wireless.default_radio0.ieee80211k='1'   # SSID IoT, 2.4 GHz
+uci set wireless.default_radio0.bss_transition='1'
+uci set wireless.wifinet2.ieee80211k='1'         # SSID khách, 5 GHz
+uci set wireless.wifinet2.bss_transition='1'
+uci set wireless.radio0.channel='11'             # CHỈ máy thứ hai
+```
+
+Kết quả: cả ba SSID trên cả hai máy đều có `rrm_neighbor_report=1`, `rrm_beacon_report=1`,
+`bss_transition=1` trong conf đang chạy; 3 SSID lên lại trên cả hai; kênh giờ là **36/1** ở máy
+thứ nhất và **100/11** ở máy thứ hai; usteer vẫn thấy nhau, vẫn `rrm_nr` cho cả 3 BSS; ping
+gateway ~1,1 ms từ cả hai.
+
+Bằng chứng đi đến tận hostapd: `ubus call hostapd.<bss> rrm_nr_list` giờ trả **2 entry cho cả ba
+BSS** trên cả hai máy — trước đó chỉ SSID chính có, vì hai SSID kia chưa bật `ieee80211k`. Tức
+usteer đã thật sự cấp neighbour report cho IoT và khách, không chỉ là cờ trong file config.
+
+**Chưa xác nhận được phần rủi ro**: lúc đổi không có **client IoT nào** đang nối (0 client ở
+`w-iot` trên cả hai máy, cả trước và sau). Nên vẫn phải soát lại từng thiết bị IoT khi chúng
+bật lên: nếu có cái nào dị ứng 802.11k/v thì nó sẽ không vào lại được, và cách lùi là bỏ hai
+dòng `ieee80211k`/`bss_transition` của `default_radio0`.
+
+Không đụng tới `ft_over_ds` (điểm hở thứ ba) — giữ 0.
 
 Và nhắc lại cái đã biết: `wpa_key_mgmt` của SSID chính là
 `SAE FT-SAE WPA-PSK WPA-PSK-SHA256 FT-PSK`, tức `sae-mixed` — đúng cấu hình nằm trong giả thuyết
@@ -1555,9 +1585,10 @@ Wi-Fi: cùng SSID / cùng khoá hai máy, 802.11k + 802.11v chạy thật, ustee
    nhấp một nhịp), tìm `FT: Derived PMK-R0` và `XXKey` để biết `sm->pmksa` có gắn hay không.
    Đây là việc tuỳ chọn: roaming đã chạy được mà không cần FT.
 8. ~~**Nạp cho máy thứ hai**~~ — xong 2026-11-07, xem mục 22. Cả hai máy giờ cùng một build.
-9. SSID khách và SSID IoT: chưa có `ieee80211k`/`bss_transition` (xem ba điểm hở ở mục 22) và
-   chưa có `ieee80211r`; `luci-app-usteer` chưa thêm.
-10. 2.4 GHz hai máy đang **cùng kênh 1** — quyết định xem có tách kênh không (mục 22).
+9. ~~SSID khách và IoT chưa có `ieee80211k`/`bss_transition`~~ và ~~2.4 GHz cùng kênh 1~~ — đã
+   vá 2026-11-07, xem cuối mục 22. Còn lại: **soát từng thiết bị IoT** khi chúng bật lên (lúc
+   đổi không có client IoT nào để kiểm), và hai SSID đó vẫn chưa có `ieee80211r` (để dành).
+   `luci-app-usteer` chưa thêm.
 
 ### Dọn dẹp còn nợ
 
