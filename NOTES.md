@@ -660,14 +660,38 @@ Không phải lỗi của patch (DSA vốn hạ user port khi conduit xuống), 
 Nhánh `dsa-conduit-open` (từ `origin/c3po-tag-8021q`, 2 commit: patch 714 + bỏ hook) để mở PR
 vào kuncy7/openwrt-nss-edma. Patch generic cũng dùng được trực tiếp cho openwrt/openwrt.
 
+Một máy thứ hai gặp đúng lỗi này, và nó đã nằm trong upstream: PR openwrt/openwrt #21496
+"qualcommax: ipq5018: pz-l8: enable PHY-to-PHY CPU link" (merge 2026-04-14) bỏ đoạn DT bị
+comment kèm chú thích *"WAN cannot work if added"* và bật `port@5 { phy-handle = <&qca8337_4>;
+phy-mode = "gmii"; ethernet = <&dp1>; }` cho CMCC PZ-L8 (IPQ5018 + QCA8337, cùng cách nối
+GE PHY ↔ PHY4 như CR8806), đồng thời đặt `ucidef_set_network_device_conduit "wan" "eth0"`. Bản
+build CrazyBoyFeng/openwrt-pz-l8 sau đó phải ghim `OPENWRT_SHA` về trước #21496 (commit
+`983cec577e`, "fix(wan): revert OPENWRT_SHA to a5c5ca06 (pre phy-to-phy)") vì *"WAN-not-working
+(DWMAC + ge_phy SGMII link not coming up)"*, và chịu mất 2 Gbps còn 1 Gbps. Đó chính là hiện
+tượng mục này mô tả: không ai mở conduit `eth0` lúc probe nên PHY4 đàm phán với một đầu không
+quảng bá gì. Vậy patch 714 nên là bản sửa cho họ — cần nhờ họ kiểm chứng, và nhắc PR #21496
+trong phần mô tả PR.
+
 ## Việc còn lại
 
 - PR 50: bản mục 12 đã soak 17,8 h (log lưu local). Còn chạy ngắn cùng commit không profile
   để so `Frame OOR`, `Overflow` và `tx_desc_alloc_fail` (chỉ xem có tăng hay không).
 - ~~Mục 15: soak tiếp nhiều ngày~~ — xong ở mục 16: 5 ngày 16 h trên bản DSA,
   `n2h_payload_alloc_fails` không tăng, MemAvailable 24-28 MiB, không rò.
-- `PDEV resets` 5 GHz: 25 lần trong 5,7 ngày, chưa biết nguyên nhân. Cần ghi bộ đếm theo thời
-  gian (cron 10 phút) để xem có đi kèm sự cố nào, và so với bản không NSS Wi-Fi offload.
+- `PDEV resets` 5 GHz: 25 lần trong 5,7 ngày, chưa biết nguyên nhân. Đã bật ghi theo thời gian
+  (memlong 10 phút ghi `pdr2`/`pdr5`); còn phải xem có đi kèm sự cố nào, và so với bản không
+  NSS Wi-Fi offload. Đã loại trừ việc rút điện/di dời: bộ đếm nằm trong phiên firmware nên mỗi
+  lần boot nó về 0, mà 25 lần đó tích trong một phiên uptime liền 5 ngày 16 h.
+- Thử `CONFIG_ATH11K_NSS_MESH_SUPPORT` (offload 802.11s qua wifi mesh manager; patch có sẵn ở
+  `package/kernel/mac80211/patches/nss/mesh/`, Kconfig nói firmware IPQ5018 12.2/12.5 đáp ứng,
+  đã đo trên GL-B3000 và Archer AX55 nhưng **chưa đo trên CR8806 với profile 256 MB**). Mesh có
+  SAE cần đổi `wpad-basic-mbedtls` sang `wpad-mesh-mbedtls`. Cần đo RAM trước/sau.
+- Thêm `usteer` (+ `luci-app-usteer`) cho roaming giữa các AP nối dây. 802.11r đã có sẵn trong
+  `wpad-basic-mbedtls` (`hostapd-basic.config` có `CONFIG_IEEE80211R=y`), nên phần thiếu chỉ là
+  usteer; gói nhẹ (chỉ phụ thuộc libubox/libubus/libnl-tiny).
+- Script chuyển cấu hình từ bản hzyitc (swconfig, OpenWrt 23.05.3) sang bản DSA này:
+  `Convert-HzyitcConfig.ps1` (PowerShell, chạy trên Windows) đã viết và thử với 3 backup giả
+  lập, còn cần một backup thật của máy đang chạy hzyitc để kiểm chứng; chưa commit vào repo.
 - ~~Mục 8: vì sao hạ pool xuống 2048 làm cạn~~ — xong, xem cuối mục 8: 2048 = `n2h_low_water_core0`.
 - Mục 16: gửi patch 714 lên upstream (PR vào kuncy7, và openwrt/openwrt cho issue 26157);
   nhờ người có Redmi AX5400 / PZ-L8 kiểm chứng.
