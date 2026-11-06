@@ -1339,6 +1339,44 @@ bằng `start-stop-daemon -S -b -m -p /var/run/memlong.pid`.
 Còn thiếu: **chưa đo thông lượng** — ảnh không có `iperf3` (gói thêm không sống qua sysupgrade),
 nên muốn có số thì phải cài lại gói trên router.
 
+### Bản sạch, không page_owner (để lấy con số RAM thật)
+
+Nhánh `ram-round2-nopageowner`, tạo bằng `git rebase --onto <999-998> <commit page_owner>`, tức
+**bỏ đúng commit DEBUG** chứ không revert: còn lại 999-998 + tắt BPF JIT + 0958b trên nền bản
+đang chạy. Lúc rebase có conflict ở `config-default` vì hai commit cùng nối vào cuối file — giữ
+lại duy nhất dòng `# CONFIG_BPF_JIT is not set`.
+
+Build (`build24-nopageowner.log`) EXIT=0. Vì kernel config đổi nên OpenWrt **tự xoá cả cây
+kernel** và làm lại từ đầu, nên hai patch được apply lại và kiểm được: `999-998` + `0958b` đều
+có; `.config` của ảnh: `# CONFIG_PAGE_OWNER is not set`, `# CONFIG_PAGE_EXTENSION is not set`,
+`# CONFIG_BPF_JIT is not set`; `bootargs-append` chỉ còn
+`root=/dev/ubiblock0_1 swiotlb=1 coherent_pool=512K` (hết `page_owner=on`); chuỗi
+`host RX rings not restored` vẫn có trong `vmlinux`, tức code vòng 2 nằm trong ảnh. Ảnh ở
+`images-nopo-<commit>/`.
+
+Đây là **bản đầu tiên không còn knob debug nào**, nên nó cũng là ứng viên để làm release. Nạp
+thì sẽ vào **slot 1**, tức ghi đè `ram-round1`; đường về sau đó là slot 0 (vòng 2 + page_owner,
+đang chạy ổn). Đo cần làm sau khi nạp: `MemAvailable` lúc nghỉ không client, so với 35,8 MiB của
+bản mesh và 41,2 MiB của vòng 2 có page_owner — dự kiến quanh **45,7 MiB**.
+
+### Biết client đang nối máy nào, khi hai máy chung SSID
+
+Ba cách, từ nhanh đến chắc:
+
+1. **Kênh**: hai máy khác kênh 5 GHz (36 và 100) nên chỉ cần nhìn kênh. Trên Windows gọi được
+   thẳng từ WSL: `netsh.exe wlan show interfaces` → in `AP BSSID`, `Channel`, `Signal`.
+   **Bẫy**: SSID IoT của *cả hai* máy đều ở kênh 1, nên với client 2.4 GHz trick này vô dụng.
+2. **BSSID**: dùng được cho mọi băng, và BSSID đã ghim cố định (mục trước) nên không đổi sau
+   reboot — byte thứ năm khác nhau giữa hai máy.
+3. **Hỏi từ phía router**: `tools/router-monitor/which-ap.sh` (để ngoài repo vì chứa IP LAN) —
+   một lệnh in cả hai máy, cả ba SSID, kèm BSSID/kênh/signal từng client. Nó **lọc station
+   chết** bằng cách đối chiếu `iw station dump` với `ubus call hostapd.<bss> get_clients`, vì
+   station dump giữ entry cũ hàng phút (đúng cái bẫy đã làm đọc nhầm log ở mục 19).
+
+Muốn client *nằm* trên một máy cụ thể để test thì đẩy bằng `bss_transition_request` (~1 giây,
+mục 19), đừng trông vào may mắn. Đo thông lượng thì nên cắm dây vào `lan3` (VLAN 68 untagged) để
+bỏ hẳn Wi-Fi khỏi phép đo.
+
 ## Việc còn lại
 
 - ~~PR 50: chạy ngắn cùng commit không profile để so `Frame OOR`, `Overflow`,
