@@ -978,8 +978,10 @@ nào flash). md5 `functions.sh`: bản đang chạy `6cb4749c…`, bản sửa `
 
 ## Việc còn lại
 
-- PR 50: bản mục 12 đã soak 17,8 h (log lưu local). Còn chạy ngắn cùng commit không profile
-  để so `Frame OOR`, `Overflow` và `tx_desc_alloc_fail` (chỉ xem có tăng hay không).
+- ~~PR 50: chạy ngắn cùng commit không profile để so `Frame OOR`, `Overflow`,
+  `tx_desc_alloc_fail`~~ — **bỏ, không làm nữa** (quyết định 2026-11-06). Bản mục 12 đã soak
+  17,8 h và kuncy7 đã merge PR 50; phép A/B này chỉ còn giá trị học thuật, mà nó đòi một lần
+  build + flash nữa.
 - ~~Mục 15: soak tiếp nhiều ngày~~ — xong ở mục 16: 5 ngày 16 h trên bản DSA,
   `n2h_payload_alloc_fails` không tăng, MemAvailable 24-28 MiB, không rò.
 - `PDEV resets` 5 GHz: 25 lần trong 5,7 ngày, chưa biết nguyên nhân. Đã bật ghi theo thời gian
@@ -992,10 +994,21 @@ nào flash). md5 `functions.sh`: bản đang chạy `6cb4749c…`, bản sửa `
   ghi `/root/memlong.log` mỗi 10 phút) để có hai chuỗi thời gian so sánh được; nhớ là nó không
   tự chạy lại sau boot.
 - ~~Thử `CONFIG_ATH11K_NSS_MESH_SUPPORT`~~ — xong ở mục 17: build, nạp cho cả hai AP, dựng link
-  802.11s thật, NSS mesh offload tạo được interface. Còn lại: đo thông lượng bằng traffic đi
-  xuyên (không kết thúc trên router), và thử mesh trên 5 GHz nếu cần backhaul nhanh.
+  802.11s thật, NSS mesh offload tạo được interface. **Dừng ở đây** (quyết định 2026-11-06):
+  chỉ dùng backhaul **dây**, nên không đo thông lượng mesh đi xuyên và không thử mesh 5 GHz
+  nữa. Hai AP giữ nguyên: cùng SSID, cùng khoá, 802.11r/k/v, nối nhau bằng một sợi trunk.
+  Việc test còn ý nghĩa là **roaming trên backhaul dây**: đi vòng với laptop/điện thoại, xem
+  hostapd có `FT` reassociation hay không, client có dính AP xa không, và quyết định có cần
+  `usteer` không. Bản build vẫn mang `wpad-mesh-mbedtls` + `CONFIG_ATH11K_NSS_MESH_SUPPORT`
+  (tốn ~262 KB ảnh, 28 KB module); không gỡ, để dành đường thử lại sau.
 - ~~Thêm `usteer`~~ — đã có trong bản mục 17 (chưa bật, chưa cấu hình; `luci-app-usteer` vẫn
-  chưa thêm). 802.11r sẵn trong `wpad-mesh-mbedtls` như cũ.
+  chưa thêm). 802.11r sẵn trong `wpad-mesh-mbedtls` như cũ. Nói rõ cho khỏi lẫn: `usteer`
+  **không** liên quan gì đến mesh. Nó là daemon điều hướng client giữa nhiều AP: các AP nói
+  chuyện với nhau qua LAN (UDP 16720) để so mức tín hiệu của cùng một client rồi chủ động đẩy
+  client sang AP tốt hơn (802.11v BSS transition, hoặc từ chối/đuổi association). Backhaul là
+  dây hay vô tuyến không quan trọng — với backhaul dây như hiện tại nó còn đúng việc hơn.
+  802.11r/k/v hiện tại chỉ làm cho việc *chuyển* nhanh và có dữ liệu để client tự quyết; usteer
+  là phần *quyết định thay client*. Tuỳ chọn, không bắt buộc.
 - ~~Script chuyển cấu hình từ bản hzyitc (swconfig, OpenWrt 23.05.3) sang bản DSA này~~ —
   `Convert-HzyitcConfig.ps1` đã kiểm bằng một backup thật, kết quả đã chạy trên máy thứ hai
   (xem mục 17), và nay đã commit vào `tools/hzyitc2nss/` của branch này. Còn lại: nếu muốn ai
@@ -1005,11 +1018,22 @@ nào flash). md5 `functions.sh`: bản đang chạy `6cb4749c…`, bản sửa `
   theo số đo ở đính chính lần hai. Còn lại: theo phản hồi reviewer, nhờ người có Redmi AX5400 /
   PZ-L8 kiểm chứng, và gửi bản `[PATCH net-next]` lên netdev. PR bỏ hook vào
   kuncy7/openwrt-nss-edma **hoãn** tới khi patch vào được `c3po-tag-8021q`.
-- 999-998: thử nhiều client (điện thoại, laptop, IoT) để chắc 16384 link descriptor đủ. Số liệu
-  lẻ 2026-11-06: máy thứ hai với 4 client (2 trên SSID chính + 2 trên SSID khách) sau 4,7 h có
-  mọi `*_desc_alloc_fail` của `wifili` = 0; vẫn còn ít client so với mục đích của phép thử.
-- BPF JIT: chỉ còn cách tắt `CONFIG_BPF_JIT` cho cả ipq50xx; hỏi upstream trước.
+- 999-998: thử nhiều client (điện thoại, laptop, IoT) để chắc 16384 link descriptor đủ.
+  **Lưu ý quan trọng (kiểm 2026-11-06)**: patch này chỉ có trên nhánh `testing`, **không** có
+  trong bản đang chạy. Hai máy đang chạy `main` + 2 commit test DSA (`2a54850797`); log build
+  cho thấy 999-990…997 đều được apply, **999-998 thì không**. Nghĩa là hai AP hiện dùng kích
+  thước gốc (64 client, 32768 descriptor, 4 MiB DMA mỗi radio), nên số liệu lẻ "4 client trong
+  4,7 h, mọi `*_desc_alloc_fail` = 0" là **đường cơ sở của bản không có patch**, không nói gì về
+  việc 16384 có đủ hay không. Muốn thử thật thì phải build nhánh `testing` rồi flash.
+- BPF JIT: được gì — vùng `bpf_prog_pack` **2 MiB** cấp lúc boot cho đúng một chương trình BPF
+  (`ptp_classifier_init`, dùng để nhận gói PTP; board này không dùng PTP). Tắt `bpf_jit_enable`
+  bằng sysctl **không** có tác dụng vì nó JIT trong `sock_init` trước mọi sysctl (mục 10, phần
+  3), nên chỉ còn cách tắt `CONFIG_BPF_JIT` trong kernel config, mà config đó dùng chung cho
+  mọi board ipq50xx — phải hỏi upstream trước.
 - Mục 18: mở PR nhánh `nss-tools-fw-mask` vào `main` của fork, và build một ảnh mang bản sửa
   (chỉ cần trước lần flash kế tiếp — hai máy đang có override `0x3` nên hành vi y hệt).
-- Giải phóng buffer RX stmmac khi NSS claim (mục 9, sửa patch 0956).
+- Giải phóng buffer RX stmmac khi NSS claim (mục 9, sửa patch 0956): được ~**4 MiB** (mỗi GMAC
+  một page pool 2 MiB cho ring RX 512, mà khi firmware NSS đã claim data plane thì ring của
+  host không nhận gói nào). Kèm theo nên trả `-EBUSY` cho `ethtool -G`/`-L` lúc đang claim:
+  mục 9 cho thấy `ethtool -G` lúc đó làm router mất hẳn đường dữ liệu, phải rút điện.
 - `coherent_pool`: xem PR 45. Pool bộ đệm trống NSS: mục 8, không hạ được.
