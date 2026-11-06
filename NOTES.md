@@ -1237,6 +1237,61 @@ firmware NSS đang nắm data plane nên hai ring này không nhận một gói 
 Sức khoẻ sau khi nạp: `eth0` 1000Mb/s link detected yes (patch 714 vẫn làm việc), `fw_mask` 0x3,
 ba SSID lên, `NSS offload: active`, firmware `NSS.FW.12.5-210-MP.R`, VLAN 68/6/7 đủ.
 
+## 21. Vòng 2: trả lại buffer RX của host khi firmware NSS nắm GMAC
+
+Patch `0958b-net-stmmac-give-the-host-RX-buffers-back-while-the-data-plane-is-claimed.patch`,
+nhánh `ram-round2` (= `ram-round1` + 1 commit). Mục tiêu là đúng hai stack 2,00 MiB tìm được ở
+mục 20.
+
+Vì sao chúng tồn tại: `__alloc_dma_rx_desc_resources()` tạo một `page_pool` với
+`pool_size = dma_rx_size` (mặc định **512**), rồi `__init_dma_rx_desc_rings()` nạp đủ 512 trang
+vào ring. Với trang 4 KiB là **2 MiB mỗi GMAC**, board này hai GMAC nên **4 MiB** — mà sau khi
+`qca_dwmac_dp_claim()` chạy thì kênh DMA của host đã stop và firmware dùng ring riêng của nó,
+nên 512 trang đó không bao giờ nhận một byte nào.
+
+Một chi tiết quan trọng: **không thể chỉ "free buffer"**. `page_pool` tái dùng trang — trả trang
+về pool chỉ cho nó vào ptr_ring của pool chứ không về lại cho hệ thống, mà `pool_size` đúng bằng
+512 nên pool giữ được hết. Phải `page_pool_destroy()` mới thật sự nhả, tức phải giải phóng cả
+*resources* của ring, không chỉ buffer.
+
+Patch làm ba việc:
+
+1. **Lúc claim**, sau khi TX đã tắt, NAPI đã tắt và DMA đã stop — tức không còn gì chạm vào ring
+   — gọi `qca_dwmac_dp_park_rx()`: `__free_dma_rx_desc_resources()` cho từng queue RX.
+2. **Lúc release**, trước khi bỏ mask IRQ và trước khi NAPI được bật lại, gọi
+   `qca_dwmac_dp_unpark_rx()`: `__alloc_dma_rx_desc_resources()` + `__init_dma_rx_desc_rings()`,
+   bỏ qua queue nào vẫn còn resources, và chỉ làm khi `netif_running(dev)`. (Hợp đồng của 0956
+   vẫn bắt chủ claim bounce interface sau release, nên ring vừa cấp lại chỉ sống một nhịp; cấp
+   lại để đường free/poll phía sau gặp đúng trạng thái nó mong đợi thay vì NULL.)
+3. Làm `__free_dma_rx_desc_resources()` **idempotent**: xoá con trỏ sau khi free
+   (`buf_pool`, `page_pool`, `dma_rx`, `dma_erx` = NULL) và return sớm khi không còn gì. Cần,
+   vì giờ ring bị free hai lần: một lần lúc claim, một lần khi interface down.
+
+Ba chỗ bảo hiểm, vì đây là lối đi dễ panic:
+
+- Nếu cấp lại lúc release **thất bại** (ENOMEM — đúng cái mình vừa cho đi), patch **không** bỏ
+  mask IRQ (giữ `dp_irq_off`, để đường `stmmac_free_irq()` cân lại sau), và log `netdev_err`.
+- `stmmac_rx()` return 0 ngay nếu `rx_q->page_pool == NULL`. Dòng đầu hàm này là
+  `page_pool_get_dma_dir(rx_q->page_pool)` nên không có cái guard này là NULL deref.
+- `unpark` bỏ qua queue còn resources, nên nếu interface bị init lại trong lúc đang claim
+  (ví dụ `change_mtu`) thì không cấp đè lên và không rò.
+
+Vì sao **không** chọn cách "ring nhỏ ngay từ probe": nó làm hỏng đường host của bản không dùng
+NSS (và của chính board này lúc chưa claim), trong khi cách này chỉ ảnh hưởng đúng lúc firmware
+đang nắm data plane. Phần chặn `ethtool -G/-L` lúc đang claim thì **đã có sẵn** từ 2026-10-26
+(`0958a-...refuse-ring-and-channel-changes...`), không viết lại.
+
+Trạng thái: patch apply sạch (`Applying ... 0958b-... using plaintext`), build đang chạy
+(`build23-ram-round2.log`). Nạp vào **slot 0** máy thứ nhất (slot 1 đang giữ vòng 1 làm đường
+về). Sau khi nạp cần kiểm:
+
+- `page_owner_stacks` không còn hai stack `__init_dma_rx_desc_rings` 512 trang → được 4 MiB.
+- `dmesg | grep qca-dwmac` phải có "data plane claimed" cho cả hai GMAC và **không** có
+  "host RX rings not restored".
+- `eth0`/`eth1` vẫn 1000Mb/s, `NSS offload: active`, thông lượng không đổi (firmware tự lo RX
+  nên không được đổi gì, nhưng vẫn phải đo).
+- Thử `ifconfig eth1 down; ifconfig eth1 up` một lần để đi qua đường release/unpark thật.
+
 ## Việc còn lại
 
 - ~~PR 50: chạy ngắn cùng commit không profile để so `Frame OOR`, `Overflow`,
@@ -1356,7 +1411,15 @@ Wi-Fi: cùng SSID / cùng khoá hai máy, 802.11k + 802.11v chạy thật, ustee
   cần nữa. Khoá FT 256-bit đang nằm ở `private-backups/ft-key-20261106.txt` (mode 600).
 - Branch `backup/notes-pre-rewrite-20261106` **vẫn còn SSID tạm** trong lịch sử: giữ vài ngày
   cho chắc rồi `git branch -D`.
-- Worktree `openwrt-upstream-wt` và hai ref cũ `dsa-conduit-open-test-old`,
-  `main-pre-rebase-20261106` chưa dọn. Tarball backup máy thứ hai nên chuyển vào
-  `private-backups/`.
+- ~~Worktree `openwrt-upstream-wt`, hai ref cũ, tarball backup máy thứ hai~~ — xong
+  2026-11-06: đã xoá hai worktree `openwrt-upstream-wt` / `openwrt-v2-wt` (branch vẫn còn trong
+  repo gốc), xoá hai ref `dsa-conduit-open-test-old` và `main-pre-rebase-20261106` sau khi
+  `git cherry` xác nhận **mọi** commit của chúng đã có chỗ khác theo patch-id, chuyển tarball
+  máy thứ hai vào `private-backups/` rồi xoá bản trùng (md5 giống hệt bản
+  `home2-...-pre-slot0-hzyitc`), xoá `__pycache__`, và `shred` khoá mesh.
+  **Giữ lại** toàn bộ `images-*` (~850 MB): ổ còn 921 GB nên xoá chẳng được gì, mà mỗi thư mục
+  là một đường về không cần build lại.
+- Bản patch 714 dạng gửi netdev (tên thật, có `Date:`, bỏ trailer `Link:` GitHub) trước nằm
+  **chưa commit** trong worktree `pr-wt` — chỉ một lệnh `git checkout` là mất. Đã cất vào branch
+  riêng `patch714-netdev-draft-20261106`, còn branch của PR giữ nguyên dạng openwrt.
 - `tcpdump-mini` + `iotflow.sh` để dựng allowlist cho đám IoT — chưa làm.
