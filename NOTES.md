@@ -1399,6 +1399,54 @@ Muốn client *nằm* trên một máy cụ thể để test thì đẩy bằng 
 mục 19), đừng trông vào may mắn. Đo thông lượng thì nên cắm dây vào `lan3` (VLAN 68 untagged) để
 bỏ hẳn Wi-Fi khỏi phép đo.
 
+## 22. Nạp bản sạch cho cả hai máy, và soát lại cấu hình roaming / backhaul dây
+
+Nạp bản `ram-round2-nopageowner` cho **máy thứ hai** 2026-11-07 00:33, vào **slot 1** (máy đó
+đang chạy slot 0), nên **đường về của máy thứ hai là slot 0 = bản mesh mục 17**. Giờ **cả hai
+máy chạy cùng một build** (`r38369+5-0ee7daae5b`) — nghĩa là không còn máy nào làm đối chứng
+"BPF JIT còn bật" nữa.
+
+MemAvailable ở mốc ~1 phút: máy thứ hai **46768 kB**, máy thứ nhất 46224 kB — cùng hạng, lệch
+do số client và DUID/hostname khác nhau. Trước đó bản mesh trên máy thứ nhất là 35744 kB.
+
+Lưu ý khi reboot máy thứ hai: nó là cầu nối máy chính xuống máy thứ nhất, nên lúc nó reboot thì
+**cả nhà mất mạng** ~40 s và laptop phải nhảy AP. Ghi vào slot không chạy nên nếu đứt giữa đường
+thì slot đang chạy vẫn còn nguyên.
+
+### Soát cấu hình: giống nhau ở đúng chỗ, khác ở đúng chỗ
+
+Soát bằng `tools/router-monitor/check-roaming.sh` (để ngoài repo vì chứa IP LAN; nó in **md5**
+của khoá chứ không in khoá).
+
+| | giống nhau hai máy | khác nhau (đúng) |
+|---|---|---|
+| SSID + khoá | cả ba SSID cùng tên, cùng `key.md5` | — |
+| FT | `mobility_domain 4f57`, cùng `ft_key.md5`, `ft_psk_generate_local=0`, `pmk_r1_push=1`, `r0kh`/`r1kh` 2 entry | `nasid` (= R0KH-ID) |
+| 802.11k/v | `rrm_neighbor_report=1`, `rrm_beacon_report=1`, `bss_transition=1` trong conf đang chạy | — |
+| PMF | `ieee80211w=1` trên SSID chính (bắt buộc cho SAE/FT-SAE) | — |
+| usteer | chạy trên cả hai, `-68` / diff 8 / aggressiveness 2, `network lan`, `rrm_nr` cho cả **3** BSS | mỗi máy thấy đúng máy kia trong `remote_hosts` |
+| VLAN | `bridge-vlan` 68/6/7 giống hệt nhau, lan3 untagged ở VLAN 68 | — |
+| mesh | **0 wifi-iface nào `mode='mesh'`** trên cả hai → đúng quyết định chỉ dùng dây | — |
+| kênh | 2.4 GHz: **cả hai đều kênh 1** | 5 GHz: 36 / 100 |
+
+### Ba điểm hở tìm thấy
+
+1. **SSID IoT (2.4 GHz) và SSID khách không có 802.11k/v.** usteer vì thế gần như **không điều
+   hướng được** client ở hai SSID đó: nó cần `rrm_nr` (11k) để gợi ý AP đích và
+   `bss_transition` (11v) để đẩy; không có thì chỉ còn cách kick thô. Thêm `ieee80211k=1` +
+   `bss_transition=1` cho hai SSID đó là rẻ, **không** cần FT, không đổi khoá. Rủi ro: vài
+   thiết bị IoT cũ dị ứng 11k/v, nên bật rồi phải soát lại từng thiết bị.
+2. **Hai máy cùng phát 2.4 GHz ở kênh 1** → đồng kênh, tự nhiễu nhau. Đổi một máy sang kênh 11
+   thì giảm nhiễu nhưng roaming 2.4 chậm hơn (client phải scan sang kênh khác mới thấy AP kia).
+   Với IoT phần lớn đứng một chỗ thì nên ưu tiên giảm nhiễu.
+3. **`ft_over_ds=0`** trong conf đang chạy, tức FT chỉ đi over-the-air. Đây **không** phải
+   nguyên nhân FT đang hỏng (nguyên nhân là thiếu PMK-R0, mục 19), nhưng nếu sau này sửa được FT
+   thì có thể bật để roam ở vùng biên nhanh hơn.
+
+Và nhắc lại cái đã biết: `wpa_key_mgmt` của SSID chính là
+`SAE FT-SAE WPA-PSK WPA-PSK-SHA256 FT-PSK`, tức `sae-mixed` — đúng cấu hình nằm trong giả thuyết
+còn lại về vì sao FT không hoàn tất (hostapd copy **PSK** vào `xxkey` khi `sm->pmksa` chưa gắn).
+
 ## Việc còn lại
 
 - ~~PR 50: chạy ngắn cùng commit không profile để so `Frame OOR`, `Overflow`,
@@ -1470,11 +1518,11 @@ bỏ hẳn Wi-Fi khỏi phép đo.
 
 | | máy thứ nhất | máy thứ hai |
 |---|---|---|
-| slot đang chạy | **slot 0** = `ram-round2` (999-998 + tắt BPF JIT + trả buffer RX + page_owner) | bản mesh mục 17 (`main` + 2 commit test DSA) |
-| slot còn lại | slot 1 = `ram-round1`, là đường về | — (chỉ nạp một slot) |
-| 999-998 | có | không |
-| BPF JIT | **tắt** | còn bật |
-| page_owner | **bật** (tốn ~4,5 MiB `page_ext`) | tắt |
+| slot đang chạy | **slot 1** = `ram-round2-nopageowner` (bản sạch) | **slot 1** = cùng bản sạch |
+| slot còn lại | slot 0 = `ram-round2` + page_owner, là đường về | slot 0 = bản mesh mục 17, là đường về |
+| 999-998 | có | có |
+| BPF JIT | tắt | tắt |
+| page_owner | tắt | tắt |
 | vai trò trong mạng | lá — được phép reboot/flash | nối máy chính xuống máy thứ nhất — **không** reboot khi đang test |
 
 Nghĩa là **hai máy hiện khác build**: mọi so sánh RAM giữa hai máy phải trừ page_owner ra, còn
@@ -1506,9 +1554,10 @@ Wi-Fi: cùng SSID / cùng khoá hai máy, 802.11k + 802.11v chạy thật, ustee
 7. **FT, nếu còn muốn truy**: chạy hostapd `-d` (sửa `/etc/init.d/wpad`, restart — Wi-Fi hai máy
    nhấp một nhịp), tìm `FT: Derived PMK-R0` và `XXKey` để biết `sm->pmksa` có gắn hay không.
    Đây là việc tuỳ chọn: roaming đã chạy được mà không cần FT.
-8. **Nạp cho máy thứ hai**: chỉ sau khi vòng 1 (+2) soak sạch trên máy thứ nhất. Máy thứ hai là
-   đường ra Internet của máy thứ nhất nên flash nó là rủi ro khác hẳn.
-9. SSID khách: chưa bật `ieee80211r`; `luci-app-usteer` chưa thêm. Cả hai đều để dành.
+8. ~~**Nạp cho máy thứ hai**~~ — xong 2026-11-07, xem mục 22. Cả hai máy giờ cùng một build.
+9. SSID khách và SSID IoT: chưa có `ieee80211k`/`bss_transition` (xem ba điểm hở ở mục 22) và
+   chưa có `ieee80211r`; `luci-app-usteer` chưa thêm.
+10. 2.4 GHz hai máy đang **cùng kênh 1** — quyết định xem có tách kênh không (mục 22).
 
 ### Dọn dẹp còn nợ
 
