@@ -646,6 +646,9 @@ Soak 5 ngày 16 h (boot 2026-10-31, đọc 2026-11-06 09:17), dùng thường ng
 - MemAvailable 24,6-27,8 MiB, `SUnreclaim` 31,5 MiB, `Slab` 39,9 MiB. Không rò.
 - `n2h_payload_alloc_fails` = 35, đúng giá trị lúc boot, không tăng suốt 5,7 ngày.
   `drv_nbuf_alloc_errors`/`drv_paged_buf_alloc_errors` = 0, `payload_free_count` 2072.
+  Thêm 2026-11-06: con số 35 không phải trùng hợp của một máy. Máy thứ nhất ngay sau boot là 8,
+  trong ~30 phút đầu lên 34-35 rồi dừng hẳn; máy thứ hai sau 4,7 h uptime cũng đúng 35. Tức nó
+  sinh ra trong giai đoạn đầu sau khi firmware chạy, không phải do tải thường ngày.
 - `PDEV resets`: 5 GHz (phy1, QCN6122) 25 lần trong 5,7 ngày (~4,4/ngày), 2.4 GHz 0 — cùng
   hiện tượng như mục 15, không có dòng nào trong dmesg/logread, client không rời mạng.
 - logread (3 ngày còn lưu) chỉ có 30 dòng `dnsmasq-dhcp: no address range available`; không có
@@ -984,7 +987,10 @@ nào flash). md5 `functions.sh`: bản đang chạy `6cb4749c…`, bản sửa `
   NSS Wi-Fi offload. Đã loại trừ việc rút điện/di dời: bộ đếm nằm trong phiên firmware nên mỗi
   lần boot nó về 0, mà 25 lần đó tích trong một phiên uptime liền 5 ngày 16 h.
   Đo thêm 2026-11-06: máy thứ hai (cùng build, uptime 4,7 h) `PDEV resets` = 0 cả hai radio —
-  chưa đủ dài để kết luận gì (4,4 lần/ngày thì 4,7 h mới ~0,9 lần).
+  chưa đủ dài để kết luận gì (4,4 lần/ngày thì 4,7 h mới ~0,9 lần). Từ 2026-11-06 20:21
+  `memlong.sh` chạy lại trên **cả hai** máy (`start-stop-daemon -S -b -m -p /var/run/memlong.pid`,
+  ghi `/root/memlong.log` mỗi 10 phút) để có hai chuỗi thời gian so sánh được; nhớ là nó không
+  tự chạy lại sau boot.
 - ~~Thử `CONFIG_ATH11K_NSS_MESH_SUPPORT`~~ — xong ở mục 17: build, nạp cho cả hai AP, dựng link
   802.11s thật, NSS mesh offload tạo được interface. Còn lại: đo thông lượng bằng traffic đi
   xuyên (không kết thúc trên router), và thử mesh trên 5 GHz nếu cần backhaul nhanh.
@@ -999,7 +1005,9 @@ nào flash). md5 `functions.sh`: bản đang chạy `6cb4749c…`, bản sửa `
   theo số đo ở đính chính lần hai. Còn lại: theo phản hồi reviewer, nhờ người có Redmi AX5400 /
   PZ-L8 kiểm chứng, và gửi bản `[PATCH net-next]` lên netdev. PR bỏ hook vào
   kuncy7/openwrt-nss-edma **hoãn** tới khi patch vào được `c3po-tag-8021q`.
-- 999-998: thử nhiều client (điện thoại, laptop, IoT) để chắc 16384 link descriptor đủ.
+- 999-998: thử nhiều client (điện thoại, laptop, IoT) để chắc 16384 link descriptor đủ. Số liệu
+  lẻ 2026-11-06: máy thứ hai với 4 client (2 trên SSID chính + 2 trên SSID khách) sau 4,7 h có
+  mọi `*_desc_alloc_fail` của `wifili` = 0; vẫn còn ít client so với mục đích của phép thử.
 - BPF JIT: chỉ còn cách tắt `CONFIG_BPF_JIT` cho cả ipq50xx; hỏi upstream trước.
 - Mục 18: mở PR nhánh `nss-tools-fw-mask` vào `main` của fork, và build một ảnh mang bản sửa
   (chỉ cần trước lần flash kế tiếp — hai máy đang có override `0x3` nên hành vi y hệt).
