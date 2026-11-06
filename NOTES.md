@@ -811,6 +811,38 @@ Thêm một dữ kiện cho câu hỏi conduit ở trên: máy thứ nhất **gi
 khi nạp lại (config đi bằng `sysupgrade -b`), nên cú đổi sang `eth1` ở máy thứ hai nghiêng về
 "chỉ xảy ra ở lần first boot có restore tarball tự đóng".
 
+### Bridge mesh vào br-lan + STP: đã thử, đã gây sự cố, đã trả về dùng dây
+
+Topology thật (quan trọng cho kết luận): router chính -> một cổng VLAN của AP thứ hai -> cổng
+VLAN còn lại sang AP thứ nhất. Tức hai AP **nối trực tiếp bằng một sợi dây**, không qua switch
+trung gian. Bridge sợi mesh vào `br-lan` ở cả hai đầu là tạo loop giữa đúng hai máy đó.
+
+Đã làm: thêm `w-mesh` vào `ports` của `br-lan` và vào cả ba `bridge-vlan` dạng tagged, bật
+`stp=1`, bỏ mạng mesh L3 và zone của nó. Máy thứ nhất chạy tốt (STP lên, `w-mesh` forwarding, đủ
+địa chỉ). Khi áp cho máy thứ hai thì mạng sập: cổng mesh của nó vào forwarding trong khi cổng dây
+cũng đang forwarding mà STP chưa chặn xong -> loop sống. Người dùng phải reset máy thứ hai và rút
+điện máy thứ nhất. Guard 180 s trên máy thứ hai (script `tools/mesh-bridge.sh`) có tác dụng: nó
+giữ bản `/etc/config/network`+`wireless` cũ và rollback phục hồi nguyên trạng.
+
+Hai điều ghi lại cho lần sau:
+
+- **Đừng** để cổng thứ hai của một loop vào forwarding rồi mới trông vào STP. Linux bridge dùng
+  STP 802.1D (không RSTP trong kernel), listening + learning = 2 x `forward_delay` = 30 s mặc
+  định, và trong cửa sổ đó loop là loop thật. Muốn làm lại thì hoặc hạ `forward_delay`, hoặc bật
+  STP ở cả hai đầu **trước** khi thêm cổng mesh, hoặc bỏ STP và dùng một script đổi cổng theo
+  carrier của cổng dây (xác định, không có cửa sổ hở).
+- Một lần đọc `root_id`/`bridge_id` giữa lúc hội tụ cho thấy "cả hai tự nhận là root" và tôi kết
+  luận sai là BPDU không qua được VLAN trunk. Đọc lại `brport/designated_root` thì thấy máy thứ
+  nhất đã nhận máy thứ hai làm root, tức BPDU qua được bình thường. Muốn biết STP có thấy nhau
+  thì đọc `/sys/class/net/<port>/brport/designated_root`, đừng đọc `root_id` của bridge một lần
+  rồi kết luận.
+
+Trạng thái cuối (cả hai AP, `tools/mesh-teardown.sh`): không còn `wireless.mesh0`, `network.mesh`,
+zone `mesh`, `w-mesh` ra khỏi `br-lan` và các `bridge-vlan`, `stp` về 0, AP thứ hai về lại kênh
+5 GHz cũ nên hai AP lại khác kênh. Giữ lại phần làm nên "mesh có dây": SSID + khoá trùng nhau ở
+cả hai, `usteer` chạy sẵn. Còn thiếu để roaming mượt: `ieee80211r`/`ieee80211k`/`bss_transition`
+hiện **chưa** bật trên wifi-iface nào (gói có hỗ trợ, config thì chưa đặt).
+
 ## Việc còn lại
 
 - PR 50: bản mục 12 đã soak 17,8 h (log lưu local). Còn chạy ngắn cùng commit không profile
