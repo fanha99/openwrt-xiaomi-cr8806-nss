@@ -1032,7 +1032,13 @@ Giữ nguyên `min_snr 0`, `assoc_steering 0`, `load_kick_enabled 0`, và **khô
 neighbor report của các SSID còn lại. `signal_diff_threshold 8` là cái chống ping-pong.
 
 Còn lại là phép thử đi vòng (cần người): mang laptop/điện thoại đi từ AP này sang AP kia, rồi xem
-`roam_events` có nhảy không và client có dính AP xa không.
+`roam_events` có nhảy không và client có dính AP xa không. Công cụ: `tools/watch-roam.sh <ip1>
+<ip2> [giây]` in mỗi vòng xem client nào đang ở AP nào, **cả hai** AP nghe nó bao nhiêu dBm, và
+`roam_events` của từng BSS; MAC rút còn 5 ký tự cuối để dán đi đâu cũng được. Mẫu đọc được
+ngay lúc bật: một client −66 dBm ở AP đang nối mà AP kia nghe −77 dBm → đúng là không nên
+chuyển, và ngưỡng hiện tại cũng không chuyển. Ghi chú thêm: có một client ngồi ở **−94 dBm**
+trên SSID khách của máy thứ hai mà máy thứ nhất không nghe thấy gì — usteer không làm gì được
+cho ca này (không có AP nào tốt hơn để chuyển tới), nhưng đáng xem đó là thiết bị nào.
 
 ## Việc còn lại
 
