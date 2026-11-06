@@ -278,7 +278,14 @@ chặn việc đổi ring.
   bảo vệ. Treo khi giữ rtnl khớp với việc router không reboot nhưng mạng không lên lại.
 - Không thử được lúc chạy. Muốn lấy lại ~4 MiB phải sửa ở phía claim: giải phóng buffer
   RX của host khi claim (cấp lại khi release, vốn đã phải bounce interface), hoặc ring nhỏ
-  từ lúc probe. Với `ethtool -G`/`-L` khi đang claim, nên trả `-EBUSY` (báo kuncy7).
+  từ lúc probe.
+- Phần `-EBUSY` **đã xong và đã nằm trong bản đang chạy** (phát hiện lại 2026-11-06, mục này
+  trước đó vẫn ghi là việc cần làm): kuncy7 nhận báo và viết
+  `0958a-net-stmmac-refuse-ring-and-channel-changes-on-a-claimed-GMAC.patch` ngày 2026-10-26
+  (commit `f6afff4714` trong fork, "Reported-by: fanha99", link issue 52). Chốt nằm sâu hơn
+  mức ethtool: `stmmac_reinit_queues()` và `stmmac_reinit_ringparam()` gọi
+  `stmmac_reinit_refuse_claimed()` và trả `-EBUSY` + `netdev_warn` khi `priv->dp_owner` còn
+  giữ. Nên đừng viết lại lần nữa — tôi đã viết trùng một bản ở tầng ethtool rồi phải bỏ.
 
 ## 10. ath11k: cache riêng cho mỗi pipe CE, link descriptor cho 32 client, BPF JIT
 
@@ -1040,6 +1047,50 @@ chuyển, và ngưỡng hiện tại cũng không chuyển. Ghi chú thêm: có 
 trên SSID khách của máy thứ hai mà máy thứ nhất không nghe thấy gì — usteer không làm gì được
 cho ca này (không có AP nào tốt hơn để chuyển tới), nhưng đáng xem đó là thiết bị nào.
 
+### Phép thử đi vòng: usteer có tác dụng, nhưng công lao thuộc về 802.11k
+
+Vòng thứ nhất không có gì xảy ra, và đó là **đúng**: hai client trên SSID chính lúc đó ở −64/−68
+dBm (ngưỡng −72), và AP kia nghe cái laptop ở −77 dBm, tức tệ hơn 9 dB — `signal_diff_threshold 8`
+đòi AP đích phải **tốt hơn** ≥ 8 dB. Không có gì để sửa thì usteer không làm gì.
+
+Vòng thứ hai, có ghi đường cong 2 s một mẫu (`tools/roamlog.sh` chạy trên cả hai AP, ghi `/tmp`
+nên không mòn flash). Một điện thoại trên SSID chính đi từ máy thứ hai sang máy thứ nhất:
+
+| giờ | việc |
+|---|---|
+| 21:16:11-21:17:04 | ở máy thứ hai, −50…−65 dBm |
+| 21:17:08 → 21:17:28 | tụt: −77, −86, −93, −81 dBm |
+| **21:17:20** | hostapd máy thứ hai: `BEACON-REQ-TX-STATUS … ack=1` rồi `BEACON-RESP-RX` — usteer xin **đo beacon 802.11k** và client **trả lời** |
+| **21:17:30** | hostapd máy thứ nhất: `associated (aid 1)`, `AP-STA-CONNECTED auth_alg=sae`, client ở −64 dBm |
+| 21:17:31 | usteer máy thứ hai ghi: `roaming station … to <bssid w-lan máy 1> disassociation timer 0, signal -88` |
+
+Đọc kỹ thứ tự: hai AP lệch đồng hồ **0 giây** (cùng một giây epoch), nên client đã associate sang
+máy thứ nhất **1 giây trước khi** usteer kịp gửi BSS transition request. Nên công lao không phải
+là cái lệnh đẩy; nó là **beacon measurement request 10 giây trước đó**: usteer bắt client đi đo,
+client thấy AP kia tốt hơn 24 dB rồi tự chuyển. Lệnh đẩy của usteer đến sau, vô hại
+(`disassociation timer 0` = `aggressiveness 1`, thuần lịch sự).
+
+**Đính chính chỗ tôi đọc sai**: `roam_events` **không** nằm trong `local_info`. Nó được đếm trên
+đối tượng **node remote** (`local_node.c` tăng `source`, `remote.c` tăng `target`), nên phải xem
+bằng `ubus call usteer remote_info`. Sau lượt roam này: máy thứ nhất thấy `…#w-lan` của máy thứ
+hai có `source=1`, máy thứ hai thấy `…#w-lan` của máy thứ nhất có `target=1`. `local_info` vẫn
+0/0 mãi mãi — nhìn vào đó mà kết luận "usteer chưa làm gì" là sai.
+
+Hai điều chưa tốt, đo được từ cùng lượt này:
+
+1. **Client đu tới −88/−93 dBm mới nhả.** Từ lúc vượt ngưỡng −72 (21:17:08) tới lúc chuyển
+   (21:17:30) là 22 giây, trong đó có một nhịp −93. Muốn sớm hơn thì nâng `roam_trigger_snr` lên
+   khoảng −68, hoặc `aggressiveness` lên 2 (thêm "disassociation imminent").
+2. **Không dùng 802.11r.** Client vào bằng `auth_alg=sae`, tức SAE đầy đủ chứ không phải fast
+   transition. Cấu hình không thiếu gì ở mức cơ bản: `mobility_domain=4f57` **giống nhau** trên
+   cả hai máy, `wpa_key_mgmt=SAE FT-SAE WPA-PSK WPA-PSK-SHA256 FT-PSK`, `bss_transition=1`,
+   `rrm_neighbor_report=1`, `rrm_beacon_report=1`, `ft_over_ds=0`. Thiếu chỗ khác:
+   `ft_psk_generate_local=1` mà **không** có `r0kh`/`r1kh`/`nas_identifier`. Sinh khoá tại chỗ chỉ
+   hợp lệ cho **FT-PSK**; **FT-SAE** thì PMK đến từ chính cuộc bắt tay SAE nên buộc phải có cặp
+   key holder R0KH/R1KH khai hai chiều giữa hai AP. SSID đang là `sae-mixed`, nên client WPA3/SAE
+   (tức các máy mới) **không** có fast transition, còn client WPA2-PSK thì có FT-PSK. Đây là việc
+   đáng làm tiếp nếu muốn roaming mượt.
+
 ## Việc còn lại
 
 - ~~PR 50: chạy ngắn cùng commit không profile để so `Frame OOR`, `Overflow`,
@@ -1096,6 +1147,5 @@ cho ca này (không có AP nào tốt hơn để chuyển tới), nhưng đáng 
   (chỉ cần trước lần flash kế tiếp — hai máy đang có override `0x3` nên hành vi y hệt).
 - Giải phóng buffer RX stmmac khi NSS claim (mục 9, sửa patch 0956): được ~**4 MiB** (mỗi GMAC
   một page pool 2 MiB cho ring RX 512, mà khi firmware NSS đã claim data plane thì ring của
-  host không nhận gói nào). Kèm theo nên trả `-EBUSY` cho `ethtool -G`/`-L` lúc đang claim:
-  mục 9 cho thấy `ethtool -G` lúc đó làm router mất hẳn đường dữ liệu, phải rút điện.
+  host không nhận gói nào). Phần `-EBUSY` của việc này **đã xong từ 2026-10-26**, xem mục 9.
 - `coherent_pool`: xem PR 45. Pool bộ đệm trống NSS: mục 8, không hạ được.
