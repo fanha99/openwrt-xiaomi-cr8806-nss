@@ -212,6 +212,21 @@ the PHY4 link in `ethtool eth0` and the QCA8337 port-4 status after 20 s; then a
 Result: unanswered by test. Left as a hook for this board only, as the maintainer allowed;
 asked whoever has an AX5400 to run the check above.
 
+Answered later (2026-11-06, `NOTES.md` section 16): it is the link, and the fix belongs in the
+DSA core, not in the board. A CPU port described with a `phy-handle` instead of a `fixed-link`
+has a PHY at each end, owned by two drivers; DSA starts the switch-side PHY at probe while
+stmmac attaches the conduit's PHY only from `stmmac_open()`. The generic patch
+`714-net-dsa-open-the-conduit-of-a-PHY-to-PHY-CPU-link.patch` opens the conduit before
+registering phylink for such a port, and with it the hook is gone: gigabit on 5 of 5 boots
+including a cold one, and 5 days 16 h of soak with `eth0` still at 1000Mb/s.
+
+One correction to the reasoning above: DT node order does not pick the default conduit.
+`qca8k_preferred_default_local_cpu_port()` (patch 711-08) returns port 0, then port 6, never
+port 5, so the CR8806, the PZ-L8 and the AX5400 all default to `eth1`. The AX5400 escapes only
+because its `02_network` puts the conduit of `wan` on `eth0`, so netifd opens eth0 when `wan`
+comes up. Move its WAN to `eth1` and it should hit the same thing; still not measured, since
+there is no AX5400 here.
+
 ## 5. Review outcome (PR 45)
 
 The maintainer accepted steps 1-4 and asked for these changes, now in the PR branch:

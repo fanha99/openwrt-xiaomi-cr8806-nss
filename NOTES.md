@@ -241,6 +241,17 @@ với các mục trước. Đối chứng 4096 chạy 4 lượt ngay trước đ
 
 Kết luận: không hạ pool. Giữ 4096.
 
+Vì sao 2048 làm cạn (đọc lại 2026-11-06): vì 2048 **đúng bằng** ngưỡng low water của firmware.
+Trên máy đang chạy: `dev.nss.n2hcfg.n2h_empty_pool_buf_core0` = 4096 (kích thước pool),
+`n2h_low_water_core0` = 2048, `n2h_high_water_core0` = 16336. Ba giá trị water mark này do
+firmware NSS báo về (`nss_n2h.c`, callback `nss_n2h_payload_stats_callback()` xử lý
+`NSS_TX_METADATA_TYPE_GET_WATER_MARK`), không phải hằng số của host. Đặt pool = low water nghĩa
+là firmware luôn ở hoặc dưới ngưỡng cấp bù, không bao giờ còn payload trống — khớp đúng với
+`payload_free_count` = 0 và alloc fail tăng ngay lúc nghỉ. Driver không chặn: handler của sysctl
+chỉ kiểm `*new_val < NSS_N2H_MIN_EMPTY_POOL_BUF_SZ` (= 32), không so với low water. Muốn thử lại
+thì phải hạ `n2h_low_water_core0` trước, và pool phải còn dư trên ngưỡng đó; vẫn không đáng vì
+mục 8 cho thấy biên ở 4096 đã mỏng.
+
 ## 9. Thu nhỏ ring RX stmmac lúc chạy: `ethtool -G eth1 rx 64`, rồi eth0
 
 Vì sao: eth0 và eth1 mỗi cái có page pool 2 MiB (RX 512), nhưng sau 15 giờ eth0 nhận 0
@@ -554,13 +565,96 @@ Rút điện khởi động lại (cold boot, 2026-10-28 11:28):
 - Laptop lại vào SSID 2.4 GHz trước (5 GHz còn chờ DFS), phải chuyển tay về 5 GHz.
 - `memlong.sh`/`climon.sh` không tự chạy sau boot, phải chạy lại.
 
+## 16. PHY4 bỏ quảng bá 1000BASE-T: sửa ở lõi DSA thay cho hook preinit
+
+Issue [openwrt/openwrt#26157](https://github.com/openwrt/openwrt/issues/26157): trên các board
+IPQ5018 nối GE PHY của SoC thẳng vào PHY4 của QCA8337 (CR8806, Redmi AX5400, CMCC PZ-L8), nếu
+không có gì mở `eth0` sớm thì PHY4 bỏ quảng bá 1000BASE-T sau ~13 s và link chỉ còn 100 Mbps.
+Board này đang che bằng hook `05_cr8806_eth0_up` (`ip link set eth0 up` lúc preinit).
+
+Vì sao: CPU port của switch mô tả bằng `phy-handle` chứ không phải `fixed-link`, nên hai đầu
+link là hai PHY của hai driver khác nhau. DSA attach và start PHY phía switch ngay trong
+`dsa_port_setup()` lúc probe, còn PHY của conduit thuộc netdev `eth0` và stmmac chỉ attach nó
+trong `stmmac_init_phy()`, mà hàm này chỉ chạy từ `stmmac_open()`. Đến khi chưa ai mở conduit,
+PHY4 autoneg với một đối tác không quảng bá gì; nó bỏ 1000BASE-T và khởi động lại autoneg sau
+đó cũng không lấy lại được.
+
+Vì sao build cũ của hzyitc (QSDK, swconfig) không bị: `qca-ssdk` sở hữu cả switch lẫn mọi PHY
+và khởi tạo chúng ngay lúc nạp module (không power-down), còn `qca-nss-dp` gọi `phy_connect()`
+trong probe, nên `phy_attach_direct()` → `phy_init_hw()` + `phy_resume()` đã bật GE PHY và để
+nó quảng bá trước lần autoneg đầu của PHY4. Kiểm lại trên một máy thứ hai cùng phần cứng (OpenWrt
+21.02.7, kernel 5.4, build `redmi,ax3000` của hzyitc): có `qca_ssdk`/`qca_nss_dp`, không có
+`dsa`/`qca8k`; `dp1` khai `qcom,link-poll` và `qcom,phy-mdio-addr = 7`; `switch_cpu_bmp` =
+0x60 (port 5+6), `port_phyinfo` map port 5 ↔ phy 4; `eth0` carrier 1, speed 1000, MIB
+`RxGoodByte` của port 5 khớp đúng `tx_bytes` của `eth0`. Nhánh DSA duy nhất hzyitc từng thử
+(`dsa-5.15`, 2/2024) chỉ giữ CPU port SGMII, port 5 là user port thường tên "cpu2", không có
+`ethernet =`, nên link PHY–PHY chưa bao giờ là conduit ở đó. Kết luận: không phải port sai.
+
+Sửa: patch `714-net-dsa-open-the-conduit-of-a-PHY-to-PHY-CPU-link.patch` (generic, pending-6.18).
+Trong `dsa_shared_port_link_register_of()`, nếu port không có `fixed-link` mà có `phy-handle`
+thì gọi `dev_open(dp->conduit)` trước khi register phylink, để hai PHY cùng lên cho lần autoneg
+đầu. Conduit `fixed-link` (tức mọi board khác) không bị ảnh hưởng. Bỏ luôn hook
+`05_cr8806_eth0_up`.
+
+Lưu ý khi đọc patch 711-08 upstream: `qca8k_preferred_default_local_cpu_port()` chỉ trả về
+port 0 rồi port 6, không bao giờ port 5. Nên thứ tự node trong DTS **không** quyết định conduit
+mặc định: CR8806, PZ-L8 và AX5400 đều mặc định `eth1`, và AX5400 chỉ thoát vì `02_network` của
+nó đặt conduit của `wan` là `eth0` (netifd mở eth0 khi `wan` lên). Dời WAN sang `eth1` là gặp
+lại. Việc sửa thứ tự `ethernet-port@5`/`@6` trong DTS CR8806 không giải quyết gì.
+
+Build test (nhánh `dsa-conduit-open-test` = main + bỏ hook + patch 714), flash slot 0, chạy
+không hook:
+
+| | |
+|---|---|
+| GE PHY attach | 2,12-2,15 s (`eth0: PHY [88000.mdio-1:07]`) |
+| PHY4 attach | 2,22-2,25 s (`qca8k …: PHY [90000.mdio-1:04]`), tức sau ~98 ms |
+| `eth0: Link is Up - 1Gbps/Full` | 4,636 s |
+| `ethtool eth0` | 1000Mb/s Full, autoneg on, link detected yes |
+| Số lần boot đạt gigabit | 5/5 (1 lần flash + 3 reboot mềm + 1 cold boot rút điện) |
+
+Các phép thử phục hồi đều giữ 1000Mb/s: `/etc/init.d/network restart`, `ifdown wan`/`ifup wan`,
+`ip link set eth0 down` 45 s rồi up. Cắm laptop vào cổng WAN (mạng riêng của cổng đó): `ethtool wan`
+1000Mb/s Full, iperf3 378 Mbit/s 1 luồng, 466 Mbit/s 4 luồng, 233 Mbit/s chiều ngược — traffic
+kết thúc tại router nên bị giới hạn CPU (NSS chỉ offload traffic đi qua router, nên bộ đếm
+netdev của `eth0` gần như không tăng), nhưng vẫn vượt xa mức ~94 Mbit/s của một link
+100BASE-TX, đủ để chứng minh PHY4 không rút 1000BASE-T. Bộ đếm switch cổng `wan` qua các lượt:
+rx 1,73 GB / tx 1,11 GB. Không có `mdio-tools` trong image nên không đọc trực tiếp được reg 9
+của PHY4.
+
+Soak 5 ngày 16 h (boot 2026-10-31, đọc 2026-11-06 09:17), dùng thường ngày, 3 client Wi-Fi:
+- `eth0` vẫn 1000Mb/s Full, link detected yes; `eth1` 1000Mb/s.
+- MemAvailable 24,6-27,8 MiB, `SUnreclaim` 31,5 MiB, `Slab` 39,9 MiB. Không rò.
+- `n2h_payload_alloc_fails` = 35, đúng giá trị lúc boot, không tăng suốt 5,7 ngày.
+  `drv_nbuf_alloc_errors`/`drv_paged_buf_alloc_errors` = 0, `payload_free_count` 2072.
+- `PDEV resets`: 5 GHz (phy1, QCN6122) 25 lần trong 5,7 ngày (~4,4/ngày), 2.4 GHz 0 — cùng
+  hiện tượng như mục 15, không có dòng nào trong dmesg/logread, client không rời mạng.
+- logread (3 ngày còn lưu) chỉ có 30 dòng `dnsmasq-dhcp: no address range available`; không có
+  lỗi ath11k/NSS, không `reo-stall-*`, không radio reset trong log.
+- dmesg: chỉ `lan2: Link is Down` vài lần (thiết bị nối dây đầu kia), không có lỗi qca8k/DSA.
+
+Upstream sau khi cập nhật (origin/c3po-tag-8021q `fb7e09acfe`, kernel 6.18.55 → **6.18.60**,
+~250 commit mới): không có commit nào liên quan đến vấn đề này. `net/dsa` chỉ bị các bản bump
+kernel chạm tới, `711-06/07/08` không đổi, slot `714` vẫn trống (upstream openwrt main cũng
+vậy: 713 và 715 đã dùng, 714 trống). Patch 714 áp được vào 6.18.60 không cần refresh. Các thay
+đổi upstream đáng để mắt cho board này: `2e20111fda` qca8k MIB autocast/management frame v2,
+`a60e90b7b1` ath11k REO hash buckets → SW1 khi chạy NSS, `82774126e3` chặn danh sách trang
+per-CPU của qca-nss-pbuf ở profile 256 MB, `04_set_netdev_label` đổi sang hai pha park/rename.
+
+Nhánh `dsa-conduit-open` (từ `origin/c3po-tag-8021q`, 2 commit: patch 714 + bỏ hook) để mở PR
+vào kuncy7/openwrt-nss-edma. Patch generic cũng dùng được trực tiếp cho openwrt/openwrt.
+
 ## Việc còn lại
 
 - PR 50: bản mục 12 đã soak 17,8 h (log lưu local). Còn chạy ngắn cùng commit không profile
   để so `Frame OOR`, `Overflow` và `tx_desc_alloc_fail` (chỉ xem có tăng hay không).
-- Mục 15: soak tiếp nhiều ngày ở slot 1 với dùng thường ngày, xem `n2h_payload_alloc_fails`,
-  `PDEV resets` 5 GHz và MemAvailable.
-- Mục 8: kiểm lại vì sao hạ pool xuống 2048 làm cạn (pool bằng đúng `n2h_low_water_core0`?).
+- ~~Mục 15: soak tiếp nhiều ngày~~ — xong ở mục 16: 5 ngày 16 h trên bản DSA,
+  `n2h_payload_alloc_fails` không tăng, MemAvailable 24-28 MiB, không rò.
+- `PDEV resets` 5 GHz: 25 lần trong 5,7 ngày, chưa biết nguyên nhân. Cần ghi bộ đếm theo thời
+  gian (cron 10 phút) để xem có đi kèm sự cố nào, và so với bản không NSS Wi-Fi offload.
+- ~~Mục 8: vì sao hạ pool xuống 2048 làm cạn~~ — xong, xem cuối mục 8: 2048 = `n2h_low_water_core0`.
+- Mục 16: gửi patch 714 lên upstream (PR vào kuncy7, và openwrt/openwrt cho issue 26157);
+  nhờ người có Redmi AX5400 / PZ-L8 kiểm chứng.
 - 999-998: thử nhiều client (điện thoại, laptop, IoT) để chắc 16384 link descriptor đủ.
 - BPF JIT: chỉ còn cách tắt `CONFIG_BPF_JIT` cho cả ipq50xx; hỏi upstream trước.
 - Giải phóng buffer RX stmmac khi NSS claim (mục 9, sửa patch 0956).
