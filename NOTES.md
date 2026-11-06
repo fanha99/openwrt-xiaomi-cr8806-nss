@@ -641,6 +641,22 @@ vậy: 713 và 715 đã dùng, 714 trống). Patch 714 áp được vào 6.18.60
 `a60e90b7b1` ath11k REO hash buckets → SW1 khi chạy NSS, `82774126e3` chặn danh sách trang
 per-CPU của qca-nss-pbuf ở profile 256 MB, `04_set_netdev_label` đổi sang hai pha park/rename.
 
+Build lại trên upstream mới (`r38062+309-c36db6321c`, kernel 6.18.60) và flash slot 1, giữ
+config: kết quả trùng khít bản 6.18.55.
+
+| | 6.18.55 | 6.18.60 |
+|---|---|---|
+| GE PHY attach | 2,12-2,15 s | 2,12-2,16 s |
+| PHY4 attach | 2,22-2,25 s | 2,23-2,26 s |
+| `eth0: Link is Up - 1Gbps/Full` | 4,636 s | 4,636-4,646 s |
+| boot đạt gigabit | 5/5 | 4/4 (1 lần flash + 3 reboot) |
+| `failed to open conduit` trong dmesg | 0 | 0 |
+
+Các phép thử phục hồi trên bản mới cũng giữ 1000Mb/s: `/etc/init.d/network restart`,
+`ifdown wan`/`ifup wan`, `ip link set eth0 down` 40 s rồi up. Lưu ý: hạ `eth0` (conduit) làm
+user port `wan` xuống admin DOWN và netifd không tự dựng lại — phải `ifup <interface của wan>`.
+Không phải lỗi của patch (DSA vốn hạ user port khi conduit xuống), nhưng nhớ khi test tay.
+
 Nhánh `dsa-conduit-open` (từ `origin/c3po-tag-8021q`, 2 commit: patch 714 + bỏ hook) để mở PR
 vào kuncy7/openwrt-nss-edma. Patch generic cũng dùng được trực tiếp cho openwrt/openwrt.
 
