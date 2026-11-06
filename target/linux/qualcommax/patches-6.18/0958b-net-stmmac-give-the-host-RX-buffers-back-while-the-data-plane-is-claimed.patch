@@ -1,0 +1,193 @@
+From: Fanha Giang <fanha99@hotmail.com>
+Subject: [PATCH] net: stmmac: give the host RX buffers back while the data plane is claimed
+
+A claimed GMAC keeps its host RX rings fully populated for nothing. The
+claim stops the host DMA channels and the NSS firmware drives the
+controller with its own descriptors and buffers, so every page sitting in
+the host page_pool is unreachable for as long as the claim lasts - and it
+is not a rounding error: pool_size is dma_rx_size, which is 512 by
+default, so 2 MiB per GMAC with 4 KiB pages, 4 MiB on an IPQ5018 board
+with two GMACs and 256 MiB of RAM in total. page_owner on a CR8806 at
+rest shows exactly that, one 512-page allocation per GMAC:
+
+  2.00 MiB  512 pages  __page_pool_alloc_netmems_slow <- __init_dma_rx_desc_rings
+                       <- init_dma_desc_rings <- stmmac_setup_dma_desc
+                       <- stmmac_open
+  2.00 MiB  512 pages  __page_pool_alloc_netmems_slow <- __init_dma_rx_desc_rings
+                       <- init_dma_desc_rings <- stmmac_setup_dma_desc
+                       <- stmmac_change_mtu
+
+Free the RX resources at the end of the claim sequence, once TX is
+disabled, NAPI is off and the channels are stopped, and allocate them
+again on release before the interrupt is unmasked and NAPI comes back
+enabled. Releasing already requires the owner to bounce the interface to
+restore the host data path, so the restored rings are short-lived in
+practice; they exist so that whatever runs next - a poll from a pending
+event, the free path of an interface going down - finds the state it
+expects rather than NULL.
+
+Three details make that safe:
+
+ - __free_dma_rx_desc_resources() now clears the pointers it frees and
+   returns early when there is nothing left, because the claim frees the
+   rings once and the interface going down frees them again.
+ - unpark skips queues that still hold their resources, so an interface
+   reinitialised while claimed (a change_mtu, say) is not leaked over.
+ - if the allocation on release fails, the interrupt is left masked and
+   stmmac_rx() bails out on a parked ring, so no poll can reach a freed
+   page_pool.
+
+Signed-off-by: Fanha Giang <fanha99@hotmail.com>
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -1939,6 +1939,14 @@
+ {
+ 	struct stmmac_rx_queue *rx_q = &dma_conf->rx_queue[queue];
+ 
++	/*
++	 * Idempotent: the data-plane claim gives these back early (see
++	 * qca_dwmac_dp_claim) and the interface going down frees them again.
++	 */
++	if (!rx_q->page_pool && !rx_q->buf_pool && !rx_q->dma_rx &&
++	    !rx_q->dma_erx)
++		return;
++
+ 	/* Release the DMA RX socket buffers */
+ 	if (rx_q->xsk_pool)
+ 		dma_free_rx_xskbufs(priv, dma_conf, queue);
+@@ -1962,8 +1970,12 @@
+ 		xdp_rxq_info_unreg(&rx_q->xdp_rxq);
+ 
+ 	kfree(rx_q->buf_pool);
++	rx_q->buf_pool = NULL;
+ 	if (rx_q->page_pool)
+ 		page_pool_destroy(rx_q->page_pool);
++	rx_q->page_pool = NULL;
++	rx_q->dma_rx = NULL;
++	rx_q->dma_erx = NULL;
+ }
+ 
+ static void free_dma_rx_desc_resources(struct stmmac_priv *priv,
+@@ -2376,6 +2388,57 @@
+ 		stmmac_stop_tx_dma(priv, chan);
+ }
+ 
++/*
++ * The host RX rings are dead weight while the firmware owns the controller:
++ * it brings its own descriptors and buffers, and the host DMA channels are
++ * stopped for the duration of the claim. What they hold is not small - a
++ * page_pool of dma_rx_size pages per queue, 2 MiB per GMAC at the default
++ * ring of 512 with 4 KiB pages, so 4 MiB on a two-GMAC IPQ5018 board that
++ * has 256 MiB of RAM in total. Give it back while it cannot be used.
++ */
++static void qca_dwmac_dp_park_rx(struct stmmac_priv *priv)
++{
++	u32 rx_count = priv->plat->rx_queues_to_use;
++	u32 queue;
++
++	for (queue = 0; queue < rx_count; queue++)
++		__free_dma_rx_desc_resources(priv, &priv->dma_conf, queue);
++}
++
++/*
++ * Undo that, skipping queues that still hold their resources - nothing
++ * parked them, or the interface was reinitialised while claimed. Leaves the
++ * rings in the state the host data path expects, while the DMA channels stay
++ * stopped: the release contract has the caller bounce the interface, which
++ * points the hardware at freshly initialised rings anyway.
++ */
++static int qca_dwmac_dp_unpark_rx(struct stmmac_priv *priv)
++{
++	u32 rx_count = priv->plat->rx_queues_to_use;
++	u32 queue;
++	int ret;
++
++	for (queue = 0; queue < rx_count; queue++) {
++		struct stmmac_rx_queue *rx_q = &priv->dma_conf.rx_queue[queue];
++
++		if (rx_q->page_pool || rx_q->buf_pool)
++			continue;
++
++		ret = __alloc_dma_rx_desc_resources(priv, &priv->dma_conf,
++						    queue);
++		if (!ret)
++			ret = __init_dma_rx_desc_rings(priv, &priv->dma_conf,
++						       queue, GFP_KERNEL);
++		if (ret) {
++			__free_dma_rx_desc_resources(priv, &priv->dma_conf,
++						     queue);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
+ /**
+  * qca_dwmac_dp_claim - hand the data plane of a dwmac netdev to an owner
+  * @dev: stmmac netdev, must be running
+@@ -2410,12 +2473,13 @@
+ 	/*
+ 	 * Quiesce the host data path in dependency order: no new TX (and no
+ 	 * CPU left inside ndo_start_xmit once netif_tx_disable returns), no
+-	 * NAPI polls, then the DMA channels themselves. RX buffers stay
+-	 * allocated but unused; the firmware brings its own rings.
++	 * NAPI polls, then the DMA channels themselves. Only once nothing can
++	 * touch the RX rings any more, give their buffers back.
+ 	 */
+ 	netif_tx_disable(dev);
+ 	stmmac_disable_all_queues(priv);
+ 	stmmac_stop_all_dma(priv);
++	qca_dwmac_dp_park_rx(priv);
+ 
+ 	/*
+ 	 * The firmware enables the DMA interrupts for itself and the line is
+@@ -2453,6 +2517,7 @@
+ int qca_dwmac_dp_release(struct net_device *dev)
+ {
+ 	struct stmmac_priv *priv;
++	int ret = 0;
+ 
+ 	ASSERT_RTNL();
+ 
+@@ -2469,11 +2534,24 @@
+ 	priv->dp_ctx = NULL;
+ 
+ 	/*
++	 * Put the RX rings back before anything can reach them: the line is
++	 * unmasked right below, and NAPI comes back enabled at the end. Done
++	 * only for a running interface - one that went down while claimed
++	 * freed them on the way, and its next open allocates its own.
++	 */
++	if (netif_running(dev)) {
++		ret = qca_dwmac_dp_unpark_rx(priv);
++		if (ret)
++			netdev_err(dev, "qca-dwmac: host RX rings not restored (%d), leaving the interrupt masked\n",
++				   ret);
++	}
++
++	/*
+ 	 * Unmask the line while NAPI is still disabled: an event left pending
+ 	 * by the firmware runs the handler once, and napi_schedule() on a
+ 	 * disabled NAPI is a no-op.
+ 	 */
+-	if (priv->dp_irq_off) {
++	if (priv->dp_irq_off && !ret) {
+ 		priv->dp_irq_off = false;
+ 		enable_irq(dev->irq);
+ 	}
+@@ -5843,6 +5921,14 @@
+ 	int xdp_status = 0;
+ 	int bufsz;
+ 
++	/*
++	 * The data-plane claim parks this ring (see qca_dwmac_dp_claim) and
++	 * masks the interrupt, so a poll normally cannot get here; it can
++	 * only if putting the ring back after a release failed.
++	 */
++	if (unlikely(!rx_q->page_pool))
++		return 0;
++
+ 	dma_dir = page_pool_get_dma_dir(rx_q->page_pool);
+ 	bufsz = DIV_ROUND_UP(priv->dma_conf.dma_buf_sz, PAGE_SIZE) * PAGE_SIZE;
+ 
