@@ -598,9 +598,27 @@ thì gọi `dev_open(dp->conduit)` trước khi register phylink, để hai PHY 
 
 Lưu ý khi đọc patch 711-08 upstream: `qca8k_preferred_default_local_cpu_port()` chỉ trả về
 port 0 rồi port 6, không bao giờ port 5. Nên thứ tự node trong DTS **không** quyết định conduit
-mặc định: CR8806, PZ-L8 và AX5400 đều mặc định `eth1`, và AX5400 chỉ thoát vì `02_network` của
-nó đặt conduit của `wan` là `eth0` (netifd mở eth0 khi `wan` lên). Dời WAN sang `eth1` là gặp
-lại. Việc sửa thứ tự `ethernet-port@5`/`@6` trong DTS CR8806 không giải quyết gì.
+mặc định: CR8806, PZ-L8 và AX5400 đều mặc định `eth1`. Việc sửa thứ tự `ethernet-port@5`/`@6`
+trong DTS CR8806 không giải quyết gì.
+
+Đính chính (2026-11-06, đọc lại openwrt main): trước đây mục này viết "AX5400 thoát vì
+`02_network` đặt conduit của `wan` là `eth0`". Sai, vì `02_network` của main đặt **y hệt** cho
+cả hai board:
+
+```
+	cmcc,pz-l8|\
+	xiaomi,redmi-ax5400)
+		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
+		ucidef_set_network_device_conduit "lan1" "eth1"   (lan2, lan3 tương tự)
+		ucidef_set_network_device_conduit "wan" "eth0"
+```
+
+Nghĩa là cả hai đều có một user port mà conduit là link PHY–PHY. Việc có bị lỗi hay không phụ
+thuộc **thời điểm** có ai mở conduit đó so với hạn ~13 s của PHY4: cấu hình nào mở `wan` sớm
+(netifd dựng interface `wan` ngay lúc boot) thì thoát, cấu hình nào không có interface `wan`
+(bản AP của pz-l8 bridge cả 4 cổng) hoặc mở muộn thì mắc. Mở conduit ngay lúc probe xoá hẳn
+cuộc đua này. Commit bật phy-to-phy cho PZ-L8 trong main là `9dfc0c3eea96` (PR #21496, merge
+2026-04-14, tác giả viết 2026-01).
 
 Build test (nhánh `dsa-conduit-open-test` = main + bỏ hook + patch 714), flash slot 0, chạy
 không hook:
