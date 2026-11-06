@@ -840,8 +840,18 @@ Hai điều ghi lại cho lần sau:
 Trạng thái cuối (cả hai AP, `tools/mesh-teardown.sh`): không còn `wireless.mesh0`, `network.mesh`,
 zone `mesh`, `w-mesh` ra khỏi `br-lan` và các `bridge-vlan`, `stp` về 0, AP thứ hai về lại kênh
 5 GHz cũ nên hai AP lại khác kênh. Giữ lại phần làm nên "mesh có dây": SSID + khoá trùng nhau ở
-cả hai, `usteer` chạy sẵn. Còn thiếu để roaming mượt: `ieee80211r`/`ieee80211k`/`bss_transition`
-hiện **chưa** bật trên wifi-iface nào (gói có hỗ trợ, config thì chưa đặt).
+cả hai, `usteer` chạy sẵn.
+
+Roaming: đã bật 802.11r/k/v **chỉ trên SSID chính** của cả hai AP (`ieee80211r=1`,
+`ft_psk_generate_local=1`, `mobility_domain` giống nhau, `ieee80211k=1`, `bss_transition=1`;
+script `tools/enable-11r.sh`). Kiểm trong `/var/run/hostapd-phy1.conf` thấy đúng:
+`wpa_key_mgmt=SAE FT-SAE WPA-PSK WPA-PSK-SHA256 FT-PSK`, `ft_psk_generate_local=1`,
+`ft_over_ds=0` (FT qua sóng, không qua DS - mặc định của OpenWrt), `rrm_neighbor_report=1`,
+`rrm_beacon_report=1`, `bss_transition=1`. Lưu ý uci `ieee80211r` **không** sinh ra dòng
+`ieee80211r=` nào trong hostapd.conf (hostapd không có khoá đó), nó thêm FT-* vào
+`wpa_key_mgmt` - nên muốn xác minh thì đọc `wpa_key_mgmt`. SSID IoT và Guest để nguyên: FT là
+chỗ thiết bị cũ hay hỏng, và chúng không cần roaming nhanh. Bản lùi: `/root/wireless.bak-before-11r`
+trên mỗi máy.
 
 ## Việc còn lại
 
