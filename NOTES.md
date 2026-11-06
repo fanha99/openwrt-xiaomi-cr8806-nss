@@ -690,6 +690,31 @@ tượng mục này mô tả: không ai mở conduit `eth0` lúc probe nên PHY4
 quảng bá gì. Vậy patch 714 nên là bản sửa cho họ — cần nhờ họ kiểm chứng, và nhắc PR #21496
 trong phần mô tả PR.
 
+Đính chính lần hai (2026-11-06, đo trực tiếp trên cả hai máy): lý thuyết "cấu hình nào mở `wan`
+sớm thì thoát" ở trên không đứng được. netifd **có** mở conduit — `dsa_user_open()` gọi
+`dev_open(dp->conduit)` trong `net/dsa/user.c`, nên chỉ cần netifd dựng interface của cổng WAN là
+`eth0` được mở — nhưng muộn. Cả hai máy (đều có `option conduit 'eth0'` cho cổng `wan`, đúng như
+PZ-L8 và AX5400 trong main) cho **hai** dòng link up trên `eth0`:
+
+```
+[    4.636] eth0: Link is Up - 1Gbps/Full    <- patch 714, ngay lúc probe
+[   21.228] eth0: Link is Up - 1Gbps/Full    <- netifd dựng tới cổng WAN (máy thứ hai: 21,920 s)
+```
+
+21 s là **~8 s sau** mốc ~13 s mà PHY4 đã bỏ quảng bá 1000BASE-T. Tức trên board này netifd không
+bao giờ kịp, và "mở sớm" không phải đường thoát: board nào không bị thì vì lý do khác (timing phần
+cứng khác, hoặc có hook ở user space). Báo cáo WAN chết của PZ-L8 sau #21496 khớp đúng với kết
+luận này.
+
+PR [openwrt/openwrt#26511](https://github.com/openwrt/openwrt/pull/26511) đã mở (patch 714 + bỏ
+hook `05_cr8806_eth0_up`). Phần Testing của PR viết lại theo đúng số đo trên: bỏ câu sai "nothing
+ever opens eth0" và câu suy đoán "usually in time", thêm cột máy thứ hai vào bảng, và thêm một mục
+loại trừ NSS offload là nguyên nhân `eth0` lên (trên máy thứ hai firmware NSS chỉ được giao GMAC1
+— `fw_mask` suy ra `0x2`, xem mục 18 — nên `eth0` nằm hẳn trên host stack, vậy mà vẫn 1Gbps/Full ở
+4,73 s với 0 cảnh báo `failed to open conduit`). CI của openwrt: 3/3 pass. File patch trong ba cây
+(`openwrt-nss`, `pr-wt`, `openwrt-upstream-wt`) giống nhau từng byte (md5 `d7d01cac…`), nên thứ PR
+mang đi đúng là thứ đã test trên phần cứng; cây upstream chỉ để đóng gói.
+
 ## 17. Bản build có mesh offload + usteer, và nạp nó cho AP thứ hai
 
 Thêm vào config của bản CR8806 đang dùng:
@@ -745,7 +770,9 @@ Mở: ở lần first boot, `option conduit 'eth0'` của cổng wan bị đổi
 trong runtime (file bị uci ghi lại và mất comment — init của ECM commit `network` cho
 `packet_steering`). Đặt lại `eth0` + `network reload` thì giữ cả file lẫn runtime. Không script nào
 trong cây ghi `conduit`; chỉ `netifd` đọc `network_device` của `board.json`, mà board.d đặt mọi cổng
-= `eth1`. Cần xem lại ở lần reboot sau.
+= `eth1`. Đã xem lại (2026-11-06): cả hai máy vẫn còn `option conduit 'eth0'` trong file và
+`upper_wan` thật trên `eth0`, sau nhiều lần reboot (máy thứ hai uptime 4,6 h; máy thứ nhất vừa
+reboot để test ở mục 18). Vậy việc bị ghi lại chỉ xảy ra ở first boot của slot mới, không tái diễn.
 
 ### Dựng thật một link 802.11s và đo
 
@@ -879,6 +906,72 @@ thật sự là uplink. Gateway nằm trong subnet thì giữ nguyên. Kiểm l�
 so với bản sinh trước đó: đúng một dòng, không có thay đổi nào khác) và một fixture dựng riêng để
 chạy cả hai nhánh (gateway trong subnet -> giữ; `proto dhcp` + gateway -> bỏ).
 
+## 18. `fw_mask` của nss-tools bỏ sót GMAC mang cổng WAN
+
+`nss-tools` tự suy ra `nss.general.fw_mask` (GMAC nào giao cho firmware NSS) trong
+`nss_dsa_fw_mask()` của `package/nss/nss-tools/files/functions.sh`. Nhánh DSA của hàm duyệt mọi
+GMAC nhưng rồi `[ "$n" = "$NSS_CONDUIT" ] || continue` — chỉ giữ **một** conduit, cái mà
+`nss_dsa_conduit()` chọn vì có nhiều user port nhất. Board nào có cổng `wan` nằm trên CPU port còn
+lại thì firmware chỉ nhận trunk LAN, còn đường dữ liệu WAN ở lại host stack.
+
+Phát hiện ra vì board này đúng là như vậy: cả hai máy suy ra `0x2` trong khi `eth0` thật sự là
+conduit của user port `wan` (`/sys/class/net/eth0/upper_wan` có thật) — và đó là lý do cả hai máy
+đang mang `fw_mask=0x3` ghi tay trong `/etc/config/nss`. Không phải chuyện riêng của board này:
+`board.d/02_network` của ipq50xx trong **openwrt main** đặt `ucidef_set_network_device_conduit
+"wan" "eth0"` cho `cmcc,pz-l8` và `xiaomi,redmi-ax5400`, fork thêm `cudy,p5`. Gốc rễ là một comment
+sai ngay trong hàm đó, viết rằng CPU port thứ hai là cái "DSA không dùng".
+
+Sửa (nhánh `nss-tools-fw-mask`, 1 commit trên `main`):
+
+- Thêm `nss_dsa_user_ports <netdev>`: user port DSA của netdev đó = những `upper_*` có
+  `phys_switch_id`. CPU port mà DSA không giao user port nào thì rỗng.
+- `nss_dsa_fw_mask()` gộp **mọi** CPU port có user port, không chỉ `NSS_CONDUIT`.
+- `nss_dsa_conduit()` và `nss_dsa_tagger()` dùng lại helper (trước mỗi chỗ tự duyệt `upper_*`), và
+  comment đầu hàm viết lại cho đúng: `nss_dsa_conduit` là **bình chọn theo số user port**, không
+  phải "the conduit".
+- `nss-dwmac-probe` in thêm cột `users` cho mỗi GMAC để cái mask tự giải thích được:
+  `eth0 … users wan` / `eth1 … users lan1,lan2,lan3`.
+
+Không thể làm xấu hơn hiện tại: thay đổi duy nhất về kết quả là "CPU port **có** user port thì
+được tính vào"; board nào không có uppers trên CPU port thứ hai thì hàm trả về đúng giá trị như
+hôm nay.
+
+Test: `package/nss/nss-tools/tests/dsa-fw-mask.test.py` dựng `/sys/class/net` giả trong tempdir
+(dir `dsa/` cho CPU port, `flags`, symlink `device` tới `39c00000.ethernet`/`39d00000.ethernet`,
+`upper_<port>`, `phys_switch_id`, `device/driver` -> `qca8k`) rồi chạy bản `functions.sh` đã thay
+đường `/sys/class/net`. Năm hình: `wan` trên CPU port thứ hai -> 0x3; mọi user port trên một
+conduit -> 0x2; board có PHY WAN riêng, up -> 0x3; cùng board, down -> 0x2; không switch -> 0x1.
+Đã kiểm là test **fail trên code cũ** (ra 0x2 ở ca thứ nhất, kiểm bằng cách tạm gỡ bản sửa). CI
+`nss-tools.yml` chạy test hai lần: python3 + `sh` của host, rồi `NSS_TEST_SH` = `sh` của busybox.
+
+Thử thật, trên **máy thứ nhất**: máy thứ hai đang làm cầu nối giữa router chính và máy thứ nhất
+(lan1 + lan2 đều 1000Mb), nên nó là máy *không* được reboot để test — chỉ reboot cái ở nhánh lá.
+Xoá override trong `/etc/config/nss`, đặt `functions.sh` mới vào `/lib/nss/`, reboot:
+
+```
+19:56:58 nss: topology dsa: GMAC map read off the board: 0:eth0,1:eth1
+19:57:06 nss-dwmac-up: topology dsa: eth1 is the DSA conduit (tagger qca-8021q)
+19:57:37 nss-dwmac-up: topology dsa: fw_mask 0x3 from the board (conduit eth1 = phys_if 1, …)
+```
+
+Thứ tự boot không thành vấn đề: `nss-dwmac-up` chỉ gọi helper khi `fw_mask` chưa đặt, và nó đã chờ
+`trunk` operstate up + `ubus network.interface.lan status` up + `sleep 3`. Khoảng cách đo được giữa
+netifd (`Interface 'lan' is now up`, 19:57:06) và lúc suy ra mask (19:57:37) là **31 s**, và lúc đó
+`upper_wan` của `eth0` đã có sẵn. Sau test, đặt lại override `0x3` mà **không** reboot: mask chỉ
+được đọc lúc boot, mà mask đang chạy vốn đã là `0x3`.
+
+Hai cái bẫy gặp trong lúc test:
+
+- Script **không có shebang** chạy qua `start-stop-daemon -S -b -x /tmp/x.sh` thì chết im lặng:
+  exec trong tiến trình con fail ENOEXEC, mà `start-stop-daemon` vẫn trả 0 và không in gì. Gọi
+  trực tiếp từ `ash` thì lại chạy, vì shell tự fallback. Luôn viết shebang.
+- `/lib/upgrade/keep.d/nss-tools` chỉ giữ `/root/auto-recovery` và `/root/pstore`, nên `/lib/nss/*`
+  vá tay **không** sống qua sysupgrade — tốt cho test (không có drift ngầm), nhưng nhớ là bản vá
+  tay sẽ mất khi nạp ảnh mới.
+
+Trạng thái: nhánh đã push lên fork, **chưa build** (logic đã chứng minh xong, chỉ cần build khi
+nào flash). md5 `functions.sh`: bản đang chạy `6cb4749c…`, bản sửa `9c4c6f2e…`.
+
 ## Việc còn lại
 
 - PR 50: bản mục 12 đã soak 17,8 h (log lưu local). Còn chạy ngắn cùng commit không profile
@@ -889,6 +982,8 @@ chạy cả hai nhánh (gateway trong subnet -> giữ; `proto dhcp` + gateway ->
   (memlong 10 phút ghi `pdr2`/`pdr5`); còn phải xem có đi kèm sự cố nào, và so với bản không
   NSS Wi-Fi offload. Đã loại trừ việc rút điện/di dời: bộ đếm nằm trong phiên firmware nên mỗi
   lần boot nó về 0, mà 25 lần đó tích trong một phiên uptime liền 5 ngày 16 h.
+  Đo thêm 2026-11-06: máy thứ hai (cùng build, uptime 4,7 h) `PDEV resets` = 0 cả hai radio —
+  chưa đủ dài để kết luận gì (4,4 lần/ngày thì 4,7 h mới ~0,9 lần).
 - ~~Thử `CONFIG_ATH11K_NSS_MESH_SUPPORT`~~ — xong ở mục 17: build, nạp cho cả hai AP, dựng link
   802.11s thật, NSS mesh offload tạo được interface. Còn lại: đo thông lượng bằng traffic đi
   xuyên (không kết thúc trên router), và thử mesh trên 5 GHz nếu cần backhaul nhanh.
@@ -898,9 +993,13 @@ chạy cả hai nhánh (gateway trong subnet -> giữ; `proto dhcp` + gateway ->
   `Convert-HzyitcConfig.ps1` đã kiểm bằng một backup thật và kết quả đã chạy trên máy thứ hai
   (xem mục 17); vẫn chưa commit vào repo nào.
 - ~~Mục 8: vì sao hạ pool xuống 2048 làm cạn~~ — xong, xem cuối mục 8: 2048 = `n2h_low_water_core0`.
-- Mục 16: gửi patch 714 lên upstream (PR vào kuncy7, và openwrt/openwrt cho issue 26157);
-  nhờ người có Redmi AX5400 / PZ-L8 kiểm chứng.
+- ~~Mục 16: gửi patch 714 lên openwrt/openwrt~~ — xong: PR #26511, CI 3/3 pass, mô tả đã sửa
+  theo số đo ở đính chính lần hai. Còn lại: theo phản hồi reviewer, nhờ người có Redmi AX5400 /
+  PZ-L8 kiểm chứng, và gửi bản `[PATCH net-next]` lên netdev. PR bỏ hook vào
+  kuncy7/openwrt-nss-edma **hoãn** tới khi patch vào được `c3po-tag-8021q`.
 - 999-998: thử nhiều client (điện thoại, laptop, IoT) để chắc 16384 link descriptor đủ.
 - BPF JIT: chỉ còn cách tắt `CONFIG_BPF_JIT` cho cả ipq50xx; hỏi upstream trước.
+- Mục 18: mở PR nhánh `nss-tools-fw-mask` vào `main` của fork, và build một ảnh mang bản sửa
+  (chỉ cần trước lần flash kế tiếp — hai máy đang có override `0x3` nên hành vi y hệt).
 - Giải phóng buffer RX stmmac khi NSS claim (mục 9, sửa patch 0956).
 - `coherent_pool`: xem PR 45. Pool bộ đệm trống NSS: mục 8, không hạ được.
