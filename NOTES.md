@@ -3,7 +3,8 @@
 Branch `notes` chỉ chứa ghi chép, không chứa cây OpenWrt:
 - `NOTES.md` (file này): các thử nghiệm RAM và Wi-Fi trên CR8806.
 - `pr45-followup.md`: các bước test cho review PR 45 (tiếng Anh).
-- `tools/`: script đo dùng trong hai file trên.
+- `tools/`: script đo dùng trong hai file trên, và `tools/hzyitc2nss/` (converter cấu hình
+  hzyitc -> bản DSA/NSS, xem mục 17).
 
 Mỗi thử nghiệm một mục: sửa gì, vì sao, đo thế nào, kết quả. Code nằm ở các branch của
 cây OpenWrt (bên dưới). Khi ổn định, code được cherry-pick sang `main`. Các commit
@@ -989,9 +990,10 @@ nào flash). md5 `functions.sh`: bản đang chạy `6cb4749c…`, bản sửa `
   xuyên (không kết thúc trên router), và thử mesh trên 5 GHz nếu cần backhaul nhanh.
 - ~~Thêm `usteer`~~ — đã có trong bản mục 17 (chưa bật, chưa cấu hình; `luci-app-usteer` vẫn
   chưa thêm). 802.11r sẵn trong `wpad-mesh-mbedtls` như cũ.
-- Script chuyển cấu hình từ bản hzyitc (swconfig, OpenWrt 23.05.3) sang bản DSA này:
-  `Convert-HzyitcConfig.ps1` đã kiểm bằng một backup thật và kết quả đã chạy trên máy thứ hai
-  (xem mục 17); vẫn chưa commit vào repo nào.
+- ~~Script chuyển cấu hình từ bản hzyitc (swconfig, OpenWrt 23.05.3) sang bản DSA này~~ —
+  `Convert-HzyitcConfig.ps1` đã kiểm bằng một backup thật, kết quả đã chạy trên máy thứ hai
+  (xem mục 17), và nay đã commit vào `tools/hzyitc2nss/` của branch này. Còn lại: nếu muốn ai
+  khác dùng thì nên đưa ra repo riêng, và README đang là tiếng Anh + một mục "dùng nhanh" tiếng Việt.
 - ~~Mục 8: vì sao hạ pool xuống 2048 làm cạn~~ — xong, xem cuối mục 8: 2048 = `n2h_low_water_core0`.
 - ~~Mục 16: gửi patch 714 lên openwrt/openwrt~~ — xong: PR #26511, CI 3/3 pass, mô tả đã sửa
   theo số đo ở đính chính lần hai. Còn lại: theo phản hồi reviewer, nhờ người có Redmi AX5400 /
