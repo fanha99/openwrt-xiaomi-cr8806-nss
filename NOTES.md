@@ -853,6 +853,32 @@ script `tools/enable-11r.sh`). Kiểm trong `/var/run/hostapd-phy1.conf` thấy 
 chỗ thiết bị cũ hay hỏng, và chúng không cần roaming nhanh. Bản lùi: `/root/wireless.bak-before-11r`
 trên mỗi máy.
 
+### Một dòng `gateway` thừa do converter mang sang
+
+Máy thứ hai hiện khối **"IPv4 Upstream"** trong LuCI (proto static, địa chỉ của cổng rời, gateway
+là router LAN) còn máy thứ nhất thì không. Nguyên nhân: interface của cổng rời (cổng WAN, dùng
+làm đường cứu hộ) trong cấu hình hzyitc cũ có `option gateway`, và converter mang nguyên văn;
+cấu hình của máy thứ nhất làm tay nên chưa từng có dòng đó.
+
+Hai điều học được:
+
+- **Khối "IPv4 Upstream" của LuCI là *khai báo*, không phải đường đi thật.** Nó liệt kê interface
+  nào khai một default route trong trạng thái netifd. Kiểm bằng
+  `ubus call network.interface.<tên> status`: máy thứ hai có `target 0.0.0.0 mask 0 nexthop <router>`
+  trong mảng route của interface đó, máy thứ nhất không có gì. Còn trong kernel thì **hai máy giống
+  hệt nhau**: đúng một default route, đi qua VLAN uplink, lấy từ lease DHCP (`ip route get` xác nhận).
+- Gateway đó không thể thành route vì nó nằm ngoài subnet của chính interface (không on-link trên
+  device đó), cộng thêm cổng không có cáp. Vô hại ở hiện tại, nhưng là bẫy ngủ: cắm một sợi từ LAN
+  vào cổng đó là có default route thứ hai cùng metric 0, và traffic do router tự phát ra (DNS, NTP,
+  cập nhật) đi cổng nào trở thành không xác định.
+
+Đã xoá dòng đó trên máy thứ hai (hai máy giờ giống nhau) và sửa `Convert-HzyitcConfig.ps1`: bỏ
+`option gateway` khi proto không phải `static`, hoặc khi gateway nằm ngoài subnet của interface;
+cả hai trường hợp ghi lý do **kèm giá trị** vào `report.md` để đặt lại bằng tay nếu interface đó
+thật sự là uplink. Gateway nằm trong subnet thì giữ nguyên. Kiểm lại bằng chính backup thật (diff
+so với bản sinh trước đó: đúng một dòng, không có thay đổi nào khác) và một fixture dựng riêng để
+chạy cả hai nhánh (gateway trong subnet -> giữ; `proto dhcp` + gateway -> bỏ).
+
 ## Việc còn lại
 
 - PR 50: bản mục 12 đã soak 17,8 h (log lưu local). Còn chạy ngắn cùng commit không profile
