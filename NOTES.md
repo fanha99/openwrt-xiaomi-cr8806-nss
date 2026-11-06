@@ -690,6 +690,63 @@ tượng mục này mô tả: không ai mở conduit `eth0` lúc probe nên PHY4
 quảng bá gì. Vậy patch 714 nên là bản sửa cho họ — cần nhờ họ kiểm chứng, và nhắc PR #21496
 trong phần mô tả PR.
 
+## 17. Bản build có mesh offload + usteer, và nạp nó cho AP thứ hai
+
+Thêm vào config của bản CR8806 đang dùng:
+
+```
+CONFIG_ATH11K_NSS_MESH_SUPPORT=y   -> tự select kmod-qca-nss-drv-wifi-meshmgr,
+                                      NSS_DRV_WIFI_MESH_ENABLE, PACKAGE_MAC80211_MESH
+CONFIG_PACKAGE_wpad-mesh-mbedtls=y (thay wpad-basic-mbedtls)
+CONFIG_PACKAGE_usteer=y
+```
+
+- `wpad-mesh-*` có `LOCAL_VARIANT=mesh`, và Makefile của hostapd map mesh -> `CONFIG_VARIANT=full`,
+  tức dùng `hostapd-full.config` + `wpa_supplicant-full.config`: vẫn `CONFIG_IEEE80211R=y`, thêm
+  `CONFIG_WNM=y`. Đổi sang bản mesh **không** mất 802.11r.
+- Patch mesh được apply đủ: `nss/mesh/0001`, `0001a`, `0002`, `0003` và `nss-extra/mesh/999-992`.
+  Build sạch, không cần sửa gì.
+- Giá: `factory.ubi` +262 KB (17,43 -> 17,69 MB), `sysupgrade.bin` +287 KB. Lúc chạy có thêm
+  module `qca_nss_wifi_meshmgr` 28 KB nạp sẵn; MemAvailable trên AP thứ hai (3 SSID) 35,1 MiB.
+- Chưa cấu hình 802.11s ở đâu: muốn backhaul mesh thì AP còn lại cũng phải chạy bản có mesh.
+
+### Máy thứ hai là cùng phần cứng M79, chỉ khác tên profile của bản hzyitc
+
+Bản hzyitc khai compatible `redmi,ax3000` và model "Redmi AX3000" nên rất dễ tưởng là board M81.
+Cách phân biệt chắc chắn mà không cần mở máy, đọc ngay trên bản đang chạy:
+
+- `dmesg` của ath11k in `board_id`: M79 (CR880x) = `0x10`, M81 (Redmi AX3000 thật / RA81) = `0x24`.
+- Radio 5 GHz của M79 là `qcn6122` (M81 là QCN6102).
+- Bảng MTD của hai máy giống hệt nhau (`rootfs`/`rootfs_1` 36 MiB + `overlay` + `data`).
+
+Sau khi nạp, DTS của mình báo đúng `Xiaomi CR8806 (M79)`. Mốc đối chiếu nếu sau này gặp máy M81
+thật: openwrt main và immortalwrt đều chưa có board đó; chỉ có repo cộng đồng (`7noemo/ra81-support`
+có DTS cho layout qualcommax + BDF, `IcySakura/redmi-ax3000-openwrt-nss` dựng trên cây kuncy7 và
+báo NSS chạy). Đừng nạp ảnh CR8806 cho M81.
+
+Đo lại patch 714 (mục 16) trên máy thứ hai: `eth0: Link is Up - 1Gbps/Full` ở **4.636 s**, 0 cảnh
+báo `failed to open conduit` — khớp từng con số với máy thứ nhất. Thêm một điểm dữ liệu cho PR 26511.
+
+### Nạp cho máy đang chạy hzyitc: cấu hình đi bằng `sysupgrade.tgz`, không restore backup cũ
+
+Quy trình: `ubiformat` slot **không** chạy -> verify kernel + `bytes_used` của squashfs -> đặt
+tarball cấu hình (kết quả converter) thành `sysupgrade.tgz` ở gốc `rootfs_data` của slot mới ->
+đổi flag -> reboot. Backup cấu hình hzyitc chỉ để lưu, không restore (swconfig không dùng được).
+
+Hai cái bẫy, đã sửa cả hai trong script nạp:
+
+1. Tarball đóng từ WSL mang uid/gid 1000. Dropbear **bỏ qua** `authorized_keys` không thuộc root,
+   nên mất đường vào bằng key (vẫn vào được bằng mật khẩu hoặc LuCI). Phải đóng bằng
+   `tar --owner=root --group=root --numeric-owner`, và script giờ chặn tarball có entry khác root.
+2. Slot mới sinh host key dropbear mới, `ssh` từ chối trước cả bước auth; vòng chờ của script vì
+   thế báo sai là "máy không lên" dù máy đã chạy. Xoá entry `known_hosts` trước khi chờ.
+
+Mở: ở lần first boot, `option conduit 'eth0'` của cổng wan bị đổi thành `eth1` cả trong file lẫn
+trong runtime (file bị uci ghi lại và mất comment — init của ECM commit `network` cho
+`packet_steering`). Đặt lại `eth0` + `network reload` thì giữ cả file lẫn runtime. Không script nào
+trong cây ghi `conduit`; chỉ `netifd` đọc `network_device` của `board.json`, mà board.d đặt mọi cổng
+= `eth1`. Cần xem lại ở lần reboot sau.
+
 ## Việc còn lại
 
 - PR 50: bản mục 12 đã soak 17,8 h (log lưu local). Còn chạy ngắn cùng commit không profile
@@ -700,16 +757,13 @@ trong phần mô tả PR.
   (memlong 10 phút ghi `pdr2`/`pdr5`); còn phải xem có đi kèm sự cố nào, và so với bản không
   NSS Wi-Fi offload. Đã loại trừ việc rút điện/di dời: bộ đếm nằm trong phiên firmware nên mỗi
   lần boot nó về 0, mà 25 lần đó tích trong một phiên uptime liền 5 ngày 16 h.
-- Thử `CONFIG_ATH11K_NSS_MESH_SUPPORT` (offload 802.11s qua wifi mesh manager; patch có sẵn ở
-  `package/kernel/mac80211/patches/nss/mesh/`, Kconfig nói firmware IPQ5018 12.2/12.5 đáp ứng,
-  đã đo trên GL-B3000 và Archer AX55 nhưng **chưa đo trên CR8806 với profile 256 MB**). Mesh có
-  SAE cần đổi `wpad-basic-mbedtls` sang `wpad-mesh-mbedtls`. Cần đo RAM trước/sau.
-- Thêm `usteer` (+ `luci-app-usteer`) cho roaming giữa các AP nối dây. 802.11r đã có sẵn trong
-  `wpad-basic-mbedtls` (`hostapd-basic.config` có `CONFIG_IEEE80211R=y`), nên phần thiếu chỉ là
-  usteer; gói nhẹ (chỉ phụ thuộc libubox/libubus/libnl-tiny).
+- ~~Thử `CONFIG_ATH11K_NSS_MESH_SUPPORT`~~ — bật và build xong ở mục 17, đã chạy trên máy
+  thứ hai. Còn phải **cấu hình thử một link 802.11s** và đo RAM khi mesh hoạt động thật.
+- ~~Thêm `usteer`~~ — đã có trong bản mục 17 (chưa bật, chưa cấu hình; `luci-app-usteer` vẫn
+  chưa thêm). 802.11r sẵn trong `wpad-mesh-mbedtls` như cũ.
 - Script chuyển cấu hình từ bản hzyitc (swconfig, OpenWrt 23.05.3) sang bản DSA này:
-  `Convert-HzyitcConfig.ps1` (PowerShell, chạy trên Windows) đã viết và thử với 3 backup giả
-  lập, còn cần một backup thật của máy đang chạy hzyitc để kiểm chứng; chưa commit vào repo.
+  `Convert-HzyitcConfig.ps1` đã kiểm bằng một backup thật và kết quả đã chạy trên máy thứ hai
+  (xem mục 17); vẫn chưa commit vào repo nào.
 - ~~Mục 8: vì sao hạ pool xuống 2048 làm cạn~~ — xong, xem cuối mục 8: 2048 = `n2h_low_water_core0`.
 - Mục 16: gửi patch 714 lên upstream (PR vào kuncy7, và openwrt/openwrt cho issue 26157);
   nhờ người có Redmi AX5400 / PZ-L8 kiểm chứng.
