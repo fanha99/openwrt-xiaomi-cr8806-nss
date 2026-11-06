@@ -1287,15 +1287,57 @@ plaintext`), và trong cùng build vẫn có `999-998` + cả hai `0958a-*` củ
 `host RX rings not restored` có trong `vmlinux` (trong `sysupgrade.bin` thì không thấy vì kernel
 đã nén). Kernel config của ảnh: `# CONFIG_BPF_JIT is not set`, `CONFIG_PAGE_OWNER=y`.
 
-Chưa nạp — **cần anh đồng ý trước**. Dự định nạp vào **slot 0** máy thứ nhất (slot 1 đang giữ
-vòng 1 làm đường về). Sau khi nạp cần kiểm:
+### Đã nạp và đo: đúng 4 MiB, không hỏng gì
 
-- `page_owner_stacks` không còn hai stack `__init_dma_rx_desc_rings` 512 trang → được 4 MiB.
-- `dmesg | grep qca-dwmac` phải có "data plane claimed" cho cả hai GMAC và **không** có
-  "host RX rings not restored".
-- `eth0`/`eth1` vẫn 1000Mb/s, `NSS offload: active`, thông lượng không đổi (firmware tự lo RX
-  nên không được đổi gì, nhưng vẫn phải đo).
-- Thử `ifconfig eth1 down; ifconfig eth1 up` một lần để đi qua đường release/unpark thật.
+Nạp vào **slot 0** máy thứ nhất 2026-11-06 22:23 (`r38369+6-0ee7daae5b`), **slot 1 giữ vòng 1
+làm đường về** (`fw_setenv flag_last_success 1; fw_setenv flag_boot_rootfs 1; reboot`). Backup
+config trước khi nạp: `private-backups/home1-20261106-2222-pre-slot0.tar.gz`.
+
+| đo lúc uptime 1 phút, không client | vòng 1 | vòng 2 |
+|---|---|---|
+| MemAvailable | 37188 kB | **41220 kB** (+4,03 MiB) |
+| `__init_dma_rx_desc_rings` 512 trang | 2 stack × 2,00 MiB | **không còn** |
+| `ath11k_dp_link_desc_setup` | 4,01 MiB | 4,01 MiB (999-998 vẫn đúng) |
+| mọi stack `bpf` | 20 KiB | 12 KiB (JIT vẫn tắt) |
+
+Chỗ `stmmac_setup_dma_desc` giờ chỉ còn 4 + 2 + 1 trang, và sáu trang còn sót dưới
+`page_pool_dma_map` là slab của xarray dùng để tra địa chỉ DMA (24 KiB) — sinh ra ở nhịp ngắn
+trước khi claim kịp park, không phải trang RX.
+
+`dmesg` có `qca-dwmac: data plane claimed` cho **cả hai** GMAC và **không** có
+`host RX rings not restored`. Cả hai cổng 1000Mb/s, `NSS offload` active, ba SSID lên.
+
+**Phép thử đường release/unpark** (chạy tách bằng `start-stop-daemon` để nếu treo thì không kéo
+theo phiên ssh): bounce `eth0` — chọn `eth0` vì nó là GMAC của cổng WAN, trên máy này không có
+thiết bị nào cắm vào, còn `eth1` là trunk duy nhất đi ra. An toàn vì glue xử lý đúng:
+`NETDEV_GOING_DOWN` → `dwmac_nss_port_unwind(..., restart_host=false)` → release **trước** khi
+stmmac đóng (nếu không thì `stmmac_release` sẽ `napi_disable` lần hai trên queue mà claim đã
+disable → treo vĩnh viễn với rtnl đang giữ, chuyện đã được ghi trong 0956).
+
+```
+ip link set eth0 down -> qca-dwmac: data plane released, bounce the interface to restore host DMA
+                         MemAvailable 42264 kB
+ip link set eth0 up   -> phys_if 0 waits for link before the NSS fw data plane
+                         qca-dwmac: data plane claimed
+                         fw DMA rings restored on phys_if 0, resumed at rx ... tx ...
+                         MemAvailable 41612 kB, carrier 1, ping gateway 2/2
+```
+
+Điểm tinh ở đây: **unpark thành công là chứng minh được**, vì hàm chỉ im lặng khi trả về 0 —
+mọi đường thất bại đều in `host RX rings not restored`. Không có dòng đó, mà sau đó
+`dev_close`/`dev_open` của glue vẫn chạy sạch và firmware resume đúng ring đã lưu.
+
+Cộng dồn cả hai vòng: bản mesh (không page_owner) 35,8 MiB → vòng 2 đo 41,2 MiB *vẫn còn*
+page_owner ngốn ~4,5 MiB, tức khoảng **45,7 MiB** nếu bỏ page_owner — hơn bản mesh gần **10 MiB**,
+khớp với 4,1 (999-998) + 2 (BPF JIT) + 4,0 (vòng 2). Việc kế tiếp là build bản **không**
+page_owner để lấy con số thật.
+
+Nhắc lại cái bẫy `keep.d`: sau lần flash này `/root` của máy thứ nhất trống trơn, `memlong.sh`
+mất theo. Đã copy lại (md5 `5d46cf13...`, khớp bản trong `tools/router-monitor/`) và chạy lại
+bằng `start-stop-daemon -S -b -m -p /var/run/memlong.pid`.
+
+Còn thiếu: **chưa đo thông lượng** — ảnh không có `iperf3` (gói thêm không sống qua sysupgrade),
+nên muốn có số thì phải cài lại gói trên router.
 
 ## Việc còn lại
 
@@ -1368,8 +1410,8 @@ vòng 1 làm đường về). Sau khi nạp cần kiểm:
 
 | | máy thứ nhất | máy thứ hai |
 |---|---|---|
-| slot đang chạy | **slot 1** = `ram-round1` (999-998 + tắt BPF JIT + page_owner) | bản mesh mục 17 (`main` + 2 commit test DSA) |
-| slot còn lại | slot 0 = bản mesh, là đường về | — (chỉ nạp một slot) |
+| slot đang chạy | **slot 0** = `ram-round2` (999-998 + tắt BPF JIT + trả buffer RX + page_owner) | bản mesh mục 17 (`main` + 2 commit test DSA) |
+| slot còn lại | slot 1 = `ram-round1`, là đường về | — (chỉ nạp một slot) |
 | 999-998 | có | không |
 | BPF JIT | **tắt** | còn bật |
 | page_owner | **bật** (tốn ~4,5 MiB `page_ext`) | tắt |
@@ -1384,11 +1426,11 @@ Wi-Fi: cùng SSID / cùng khoá hai máy, 802.11k + 802.11v chạy thật, ustee
 
 ### Cần test thêm — xếp theo thứ tự nên làm
 
-1. **Vòng 2** (xem bullet ở trên): viết patch, build, nạp lên slot 0 của máy thứ nhất, rồi đo
-   lại bằng page_owner xem hai stack 2,00 MiB kia có mất hẳn không, và `eth0`/`eth1` còn
-   1000Mb/s + `NSS offload: active` không.
-2. **Bỏ page_owner rồi đo con số thật**: hiện MemAvailable 36,9 MiB đã gồm ~4,5 MiB `page_ext`.
-   Chỉ sau khi tắt page_owner mới biết vòng 1 (+2) để lại bao nhiêu RAM dùng được thật.
+1. ~~**Vòng 2**: viết patch, build, nạp, đo lại~~ — **xong 2026-11-06**, xem cuối mục 21: hai
+   stack 2,00 MiB mất hẳn, MemAvailable +4,03 MiB, đường release/unpark đã thử thật trên `eth0`.
+2. **Bỏ page_owner rồi đo con số thật** (việc kế tiếp): hiện 41,2 MiB vẫn còn ~4,5 MiB
+   `page_ext` của page_owner. Chỉ sau khi tắt mới biết cả hai vòng để lại bao nhiêu RAM dùng
+   thật — dự kiến quanh 45,7 MiB, so với 35,8 MiB của bản mesh.
 3. **Soak vòng 1 (+2)**: để chạy liền nhiều ngày, theo `n2h_payload_alloc_fails`,
    `*_desc_alloc_fail`, MemAvailable, `PDEV resets` — y như mục 15/16 đã làm với bản DSA.
 4. **999-998 với nhiều client**: 16384 link descriptor là cho 32 client. Phải có điện thoại +
