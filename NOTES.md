@@ -776,6 +776,26 @@ wpa_supplicant[w-mesh]: MESH-PEER-CONNECTED   (SAE, -42..-49 dBm)
   đưa hai AP về cùng một kênh 5 GHz (hiện cố ý tách ch36/ch100 cho roaming).
 - Giá RAM của mesh khi chạy: MemAvailable 35,7 -> 32,8 MiB ở máy thứ nhất, 35,1 -> 32,4 ở máy thứ hai.
 
+Đo lại sau khi chuyển mesh sang 5 GHz (radio1) và đưa cả hai AP về **cùng ch36 HE160**
+(ch36 hơn ch100 ở chỗ 80 MHz đầu không phải DFS), vẫn traffic kết thúc trên router:
+
+| | mesh 2.4 GHz ch1 | mesh 5 GHz ch36 HE160 |
+|---|---|---|
+| TCP 1 luồng | 9,4 Mbit/s | **281** Mbit/s |
+| TCP 4 luồng | 10,2 | **446** |
+| TCP chiều về | 16,5 | **261** |
+| UDP (ép 100M / 400M) | 17,9 (mất 7,9%) | 173 (mất 11%) |
+| PHY tx/rx | 275,2 / 275,2 (HE-MCS5 NSS2 40 MHz) | **1729,6 / 1441,3** (HE-MCS8/7 NSS2 160 MHz) |
+| kênh busy | 72% (111429/153923 ms) | 23,5% (25340/107706 ms) |
+| tx retries / failed | 0 / 0 | 0 / 0 |
+
+Tức là link 2.4 GHz không phải lỗi mesh mà là kênh 1 đã kín. Con số 446 Mbit/s đã **sát mức
+CPU** của traffic kết thúc trên router (mục 16 đo iperf3 qua cổng WAN được 378-466 Mbit/s), nên
+nó là *sàn* chứ chưa phải trần của backhaul: traffic đi xuyên thì đi đường NSS, không lên host.
+Đổi lại, hai AP giờ cùng một kênh 5 GHz nên chia nhau thời gian phát - cái giá phải trả để hai
+đầu mesh gặp nhau. Không có lỗi nào từ meshmgr (`WiFi Mesh interface count:1`, 0 dòng
+fail/error/nack), MemAvailable lúc rỗi 27,4 MiB (máy thứ nhất, sau tải nặng) và 32,7 (máy thứ hai).
+
 Cùng lần này: đổi SSID của máy thứ nhất cho trùng máy thứ hai (khoá vốn đã trùng) để có roaming
 thật; 802.11r sẵn trong `wpad-mesh-mbedtls`, `usteer` cài sẵn nhưng **chưa bật**.
 
