@@ -1258,14 +1258,16 @@ ba SSID lên, `NSS offload: active`, firmware `NSS.FW.12.5-210-MP.R`, VLAN 68/6/
   802.11s thật, NSS mesh offload tạo được interface. **Dừng ở đây** (quyết định 2026-11-06):
   chỉ dùng backhaul **dây**, nên không đo thông lượng mesh đi xuyên và không thử mesh 5 GHz
   nữa. Hai AP giữ nguyên: cùng SSID, cùng khoá, 802.11r/k/v, nối nhau bằng một sợi trunk.
-  Việc test còn ý nghĩa là **roaming trên backhaul dây**: đi vòng với laptop/điện thoại, xem
-  hostapd có `FT` reassociation hay không, client có dính AP xa không, và quyết định có cần
-  `usteer` không. Bản build vẫn mang `wpad-mesh-mbedtls` + `CONFIG_ATH11K_NSS_MESH_SUPPORT`
+  Phần test còn ý nghĩa — **roaming trên backhaul dây** — đã làm xong ở **mục 19**: đã đi vòng
+  thật, đã siết usteer, đã dựng cách đẩy client bằng lệnh để không phải đi nữa, và đã kết luận
+  FT không hoàn tất (SAE đầy đủ mỗi lần, không phải `auth_alg=ft`). Bản build vẫn mang `wpad-mesh-mbedtls` + `CONFIG_ATH11K_NSS_MESH_SUPPORT`
   (tốn ~262 KB ảnh, 28 KB module); không gỡ, để dành đường thử lại sau.
 - ~~Thêm `usteer`~~ — xem **mục 19**: nó đã tự chạy sẵn trên cả hai AP (mặc định của gói bật
   service), chỉ là không steer gì vì mọi ngưỡng mặc định bằng 0; đã bật mức nhẹ nhất ngày
-  2026-11-06. Còn lại: phép thử đi vòng, rồi quyết định có nâng `aggressiveness` không.
-  `luci-app-usteer` vẫn chưa thêm. 802.11r sẵn trong `wpad-mesh-mbedtls` như cũ, và usteer
+  2026-11-06, rồi siết một bậc nữa sau khi thấy client đu tới −88 dBm (`roam_trigger_snr -68`,
+  `signal_diff_threshold 8`, `aggressiveness 2`). Phép thử đi vòng **đã làm**, chuỗi steer chạy
+  đủ từ đầu đến cuối — xem bảng và phần "FT vẫn không chạy" ở mục 19. `luci-app-usteer` vẫn
+  chưa thêm. 802.11r sẵn trong `wpad-mesh-mbedtls` như cũ, và usteer
   **không** liên quan gì đến mesh — nó điều hướng client giữa các AP qua LAN, backhaul dây hay
   vô tuyến đều dùng được.
 - ~~Script chuyển cấu hình từ bản hzyitc (swconfig, OpenWrt 23.05.3) sang bản DSA này~~ —
@@ -1279,20 +1281,82 @@ ba SSID lên, `NSS offload: active`, firmware `NSS.FW.12.5-210-MP.R`, VLAN 68/6/
   kuncy7/openwrt-nss-edma **hoãn** tới khi patch vào được `c3po-tag-8021q`.
 - 999-998: đã đo lại ở **mục 20** (4,01 MiB cho cả hai radio, đúng như thiết kế). Còn lại:
   thử nhiều client (điện thoại, laptop, IoT) để chắc 16384 link descriptor đủ.
-  **Lưu ý quan trọng (kiểm 2026-11-06)**: patch này chỉ có trên nhánh `testing`, **không** có
-  trong bản đang chạy. Hai máy đang chạy `main` + 2 commit test DSA (`2a54850797`); log build
-  cho thấy 999-990…997 đều được apply, **999-998 thì không**. Nghĩa là hai AP hiện dùng kích
-  thước gốc (64 client, 32768 descriptor, 4 MiB DMA mỗi radio), nên số liệu lẻ "4 client trong
-  4,7 h, mọi `*_desc_alloc_fail` = 0" là **đường cơ sở của bản không có patch**, không nói gì về
-  việc 16384 có đủ hay không. Muốn thử thật thì phải build nhánh `testing` rồi flash.
+  **Nó nằm ở đâu (2026-11-06)**: có trong nhánh `ram-round1` đang chạy ở **slot 1 của máy thứ
+  nhất**; **không** có ở máy thứ hai (và không có ở slot 0 làm đường về). Số liệu lẻ "4 client
+  trong 4,7 h, mọi `*_desc_alloc_fail` = 0" ghi trước đó là **đường cơ sở của bản không có
+  patch**, không nói gì về việc 16384 có đủ hay không.
 - BPF JIT: được gì — vùng `bpf_prog_pack` **2 MiB** cấp lúc boot cho đúng một chương trình BPF
   (`ptp_classifier_init`, dùng để nhận gói PTP; board này không dùng PTP). Tắt `bpf_jit_enable`
   bằng sysctl **không** có tác dụng vì nó JIT trong `sock_init` trước mọi sysctl (mục 10, phần
-  3), nên chỉ còn cách tắt `CONFIG_BPF_JIT` trong kernel config, mà config đó dùng chung cho
-  mọi board ipq50xx — phải hỏi upstream trước.
+  3), nên chỉ còn cách tắt `CONFIG_BPF_JIT` trong kernel config. **Đã thử thật ở mục 20**: tắt
+  trong `config-default` của subtarget ipq50xx thì mọi stack có chữ `bpf` tụt từ 2 MiB xuống
+  20 KiB, không hỏng gì (không có `BPF_JIT_ALWAYS_ON`, và board này không chạy BPF nào khác).
+  Còn lại: config đó dùng chung cho mọi board ipq50xx nên **phải hỏi upstream** trước khi đề
+  nghị tắt mặc định; chuyện riêng của mình thì cứ giữ trong fork.
 - Mục 18: mở PR nhánh `nss-tools-fw-mask` vào `main` của fork, và build một ảnh mang bản sửa
   (chỉ cần trước lần flash kế tiếp — hai máy đang có override `0x3` nên hành vi y hệt).
-- Giải phóng buffer RX stmmac khi NSS claim (mục 9, sửa patch 0956): được ~**4 MiB** (mỗi GMAC
-  một page pool 2 MiB cho ring RX 512, mà khi firmware NSS đã claim data plane thì ring của
-  host không nhận gói nào). Phần `-EBUSY` của việc này **đã xong từ 2026-10-26**, xem mục 9.
+- **Vòng 2 (việc lớn còn lại)**: giải phóng page pool RX của stmmac khi NSS claim GMAC, cấp lại
+  khi release (mục 9, trên nền patch 0956). Không còn là phỏng đoán nữa — mục 20 đo được đúng
+  **4,00 MiB**, hai stack mỗi stack 2,00 MiB (512 trang), một qua `stmmac_open`, một qua
+  `stmmac_change_mtu`. Cách làm đã chọn: thả **lúc claim**, cấp lại **lúc release** (release vốn
+  đã phải bounce interface nên không thêm rủi ro ở đường đó) — **không** chọn "ring nhỏ ngay từ
+  probe", vì cách đó làm hỏng đường host của bản không NSS. Phần `-EBUSY` chặn `ethtool -G/-L`
+  lúc đang claim **đã có sẵn từ 2026-10-26** (kuncy7, `0958a-*`), **đừng viết lại** — xem mục 9.
 - `coherent_pool`: xem PR 45. Pool bộ đệm trống NSS: mục 8, không hạ được.
+
+### Trạng thái hai máy, chốt ngày 2026-11-06
+
+| | máy thứ nhất | máy thứ hai |
+|---|---|---|
+| slot đang chạy | **slot 1** = `ram-round1` (999-998 + tắt BPF JIT + page_owner) | bản mesh mục 17 (`main` + 2 commit test DSA) |
+| slot còn lại | slot 0 = bản mesh, là đường về | — (chỉ nạp một slot) |
+| 999-998 | có | không |
+| BPF JIT | **tắt** | còn bật |
+| page_owner | **bật** (tốn ~4,5 MiB `page_ext`) | tắt |
+| vai trò trong mạng | lá — được phép reboot/flash | nối máy chính xuống máy thứ nhất — **không** reboot khi đang test |
+
+Nghĩa là **hai máy hiện khác build**: mọi so sánh RAM giữa hai máy phải trừ page_owner ra, còn
+roaming/usteer thì không bị ảnh hưởng (chúng không dính gì tới ba thay đổi trên). Backhaul là
+**dây**, một sợi trunk; mesh vô tuyến chỉ còn nằm trong image, không dùng, không test.
+
+Wi-Fi: cùng SSID / cùng khoá hai máy, 802.11k + 802.11v chạy thật, usteer siết một bậc
+(`-68` / diff 8 / aggressiveness 2), FT-SAE khai tường minh nhưng **chưa hoàn tất lần nào**.
+
+### Cần test thêm — xếp theo thứ tự nên làm
+
+1. **Vòng 2** (xem bullet ở trên): viết patch, build, nạp lên slot 0 của máy thứ nhất, rồi đo
+   lại bằng page_owner xem hai stack 2,00 MiB kia có mất hẳn không, và `eth0`/`eth1` còn
+   1000Mb/s + `NSS offload: active` không.
+2. **Bỏ page_owner rồi đo con số thật**: hiện MemAvailable 36,9 MiB đã gồm ~4,5 MiB `page_ext`.
+   Chỉ sau khi tắt page_owner mới biết vòng 1 (+2) để lại bao nhiêu RAM dùng được thật.
+3. **Soak vòng 1 (+2)**: để chạy liền nhiều ngày, theo `n2h_payload_alloc_fails`,
+   `*_desc_alloc_fail`, MemAvailable, `PDEV resets` — y như mục 15/16 đã làm với bản DSA.
+4. **999-998 với nhiều client**: 16384 link descriptor là cho 32 client. Phải có điện thoại +
+   laptop + đám IoT lên cùng lúc trên máy thứ nhất rồi xem `*_desc_alloc_fail` và `Frame OOR`.
+   Đây là phép thử duy nhất có thể làm 999-998 lộ ra là hạ quá tay.
+5. **`PDEV resets` 5 GHz**: `memlong.sh` đang ghi 10 phút một lần trên **cả hai** máy từ
+   2026-11-06 20:21; cần vài ngày để so hai chuỗi. Nhớ nó **không** tự chạy lại sau boot — mỗi
+   lần flash/reboot phải bật lại tay.
+6. **Roaming với ngưỡng mới**: ngưỡng `-68` + aggressiveness 2 mới đặt sau lần đi vòng, chưa
+   sống qua một ngày dùng thật. Cần xem có steer **sớm quá** hay ping-pong giữa hai AP không;
+   dấu hiệu là `roam_events` trên **remote node** (`ubus call usteer remote_info`, **không**
+   phải `local_info`) tăng liên tục khi đứng yên.
+7. **FT, nếu còn muốn truy**: chạy hostapd `-d` (sửa `/etc/init.d/wpad`, restart — Wi-Fi hai máy
+   nhấp một nhịp), tìm `FT: Derived PMK-R0` và `XXKey` để biết `sm->pmksa` có gắn hay không.
+   Đây là việc tuỳ chọn: roaming đã chạy được mà không cần FT.
+8. **Nạp cho máy thứ hai**: chỉ sau khi vòng 1 (+2) soak sạch trên máy thứ nhất. Máy thứ hai là
+   đường ra Internet của máy thứ nhất nên flash nó là rủi ro khác hẳn.
+9. SSID khách: chưa bật `ieee80211r`; `luci-app-usteer` chưa thêm. Cả hai đều để dành.
+
+### Dọn dẹp còn nợ
+
+- Mở PR nhánh `nss-tools-fw-mask` vào `main` của fork (mục 18).
+- Gửi patch 714 thành `[PATCH net-next]` lên netdev, và theo phản hồi ở PR #26511.
+- `private-backups/mesh-key-20261106.txt` và các bản `/root/*.bak*` trên router: xoá khi không
+  cần nữa. Khoá FT 256-bit đang nằm ở `private-backups/ft-key-20261106.txt` (mode 600).
+- Branch `backup/notes-pre-rewrite-20261106` **vẫn còn SSID tạm** trong lịch sử: giữ vài ngày
+  cho chắc rồi `git branch -D`.
+- Worktree `openwrt-upstream-wt` và hai ref cũ `dsa-conduit-open-test-old`,
+  `main-pre-rebase-20261106` chưa dọn. Tarball backup máy thứ hai nên chuyển vào
+  `private-backups/`.
+- `tcpdump-mini` + `iotflow.sh` để dựng allowlist cho đám IoT — chưa làm.
