@@ -1129,8 +1129,69 @@ uci set usteer.@usteer[0].aggressiveness='2'   # thêm "disassociation imminent"
 ```
 
 Backup trước khi sửa: `/root/pre-sync-20261106/wireless.before-ftsae` và `usteer.before-tighten`
-trên cả hai máy. Việc còn lại: đi vòng lần nữa và xem hostapd của AP đích báo `auth_alg=ft`
-thay vì `sae` — đó mới là bằng chứng FT chạy.
+trên cả hai máy. (Lưu ý: thư mục đó trên máy thứ nhất **mất theo lần flash** ở mục 20 —
+`keep.d` chỉ giữ `/root/auto-recovery` và `/root/pstore`. Bản chụp `/etc/config` trước khi
+flash vẫn còn trong tarball ở `private-backups/`.) Kết quả thử: xem ngay dưới.
+
+### FT vẫn không chạy, và đây là tất cả những gì đã loại trừ được
+
+Tin tốt trước: **không cần đi vòng để test roaming nữa.** Đẩy client bằng chính lệnh 802.11v:
+
+```sh
+ubus call hostapd.w-lan bss_transition_request \
+  '{"addr":"<mac>","disassociation_imminent":false,"disassociation_timer":0,
+    "validity_period":30,"neighbors":["<NR hex của AP đích>"],"abridged":true}'
+```
+
+NR lấy bằng `ubus call hostapd.w-lan rrm_nr_get_own` trên AP đích. Client trả lời
+`BSS-TM-RESP status_code=0` và chuyển trong **~1 giây**. Hai cái bẫy khi đo: (1) **đừng** dùng
+`iw dev … station dump` để biết client đã chuyển chưa — entry cũ còn đọng lại hàng phút nên nó
+báo "đã ở đây" sai; đọc dòng `associated` trong log của AP đích. (2) `ubus call` sẽ lỗi nếu client
+không còn trên AP mình gọi.
+
+Kết quả: FT **chưa bao giờ hoàn tất**. Mọi lần roam đều ra đúng một mẫu:
+
+```
+FT: Missing required pairwise in pull response from <AP nguồn>
+STA <mac> IEEE 802.11: associated
+AP-STA-CONNECTED <mac> auth_alg=sae      <- SAE đầy đủ, không phải ft
+```
+
+Đối xứng cả hai chiều, và không đổi khi: dùng wildcard `r0kh`/`r1kh`, hay khai **tường minh** cả
+hai AP bằng MAC + nasid thật với một khoá 256-bit chung, hay bật `pmk_r1_push=1`.
+
+Đọc source hostapd 2026.08.07 thì thông điệp đó chỉ ra đúng một chỗ: trong `wpa_ft_rrb_rx_pull()`,
+nếu `wpa_ft_fetch_pmk_r0()` **không tìm thấy** thì hostapd vẫn gửi response nhưng dựng bằng
+`wpa_ft_rrb_build()` thay vì `wpa_ft_rrb_build_r0()`, tức **không có TLV PMK/pairwise**; bên xin
+kéo nhận được, giải mã được, rồi báo "Missing required pairwise". Nghĩa là:
+
+- **Vận chuyển và khoá RRB đều đúng** — response giải mã được thì khoá r0kh/r1kh phải khớp, và
+  frame L2 qua `ft_iface` (`br-lan.68`) đi được cả hai chiều.
+- Thứ thiếu là **PMK-R0 ở AP nguồn**.
+
+Phía client không có vấn đề gì: assoc request của điện thoại khai AKM `00-0f-ac:09` = **FT-SAE**,
+có Mobility Domain đúng `4f57`, và có **PMKID**. (Nhưng laptop thì chỉ khai `SAE` trần — **nó sẽ
+không bao giờ dùng FT** dù cấu hình thế nào. Đáng biết trước khi đi sửa.)
+
+Đã loại trừ được, bằng cách đọc source chứ không đoán:
+
+- `r0_key_lifetime` mặc định **1209600 s** (`ap_config.c`), không phải 0 → không phải hết hạn tức thì.
+- `wpa_key_mgmt_sae()` trong `defs.h` **có** gồm `WPA_KEY_MGMT_FT_SAE` → nhánh lấy PMK của SAE
+  không bị bỏ qua vì sai kiểu AKM.
+- `nas_identifier` có trên cả hai máy và khác nhau; `mobility_domain` giống nhau; khoá FT giống nhau.
+
+Chưa loại trừ được, và cần log hostapd mức `-d` mới biết: ở `SM_STATE(WPA_PTK, INITPSK)`
+(`wpa_auth.c`), `sm->xxkey` — gốc của cả cây khoá FT — chỉ lấy từ PMK của SAE khi
+`wpa_auth_uses_sae(sm) && sm->pmksa`. Nếu `sm->pmksa` chưa gắn vào station lúc đó thì trên SSID
+`sae-mixed` hostapd đã copy **PSK** vào `xxkey` ở nhánh trên, và PMK-R0 sinh ra sẽ có PMKR0Name mà
+client không bao giờ tính ra → đúng y hiện tượng "No matching PMK-R0-Name". Lưu ý
+`wpa_auth_pmksa_add_sae()` chỉ thêm vào **cache**, nó **không** gán `sm->pmksa`.
+
+Kết luận thực dụng: để nguyên cấu hình tường minh (đúng hơn wildcard, và vô hại), và **không đổi
+SSID sang WPA2 chỉ để lấy FT-PSK**. Roaming đã chạy tốt bằng 802.11k/v + usteer; FT chỉ rút ngắn
+thời gian xác thực lại. Muốn truy tiếp thì bước kế là chạy hostapd với `-d` (phải sửa
+`/etc/init.d/wpad` và restart, Wi-Fi cả hai máy nhấp một nhịp), xem nó in gì quanh
+`FT: Derived PMK-R0` / `XXKey`.
 
 ## 20. Vòng 1 tiết kiệm RAM: 999-998 + tắt BPF JIT, đo bằng page_owner
 
