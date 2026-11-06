@@ -1281,9 +1281,14 @@ NSS (và của chính board này lúc chưa claim), trong khi cách này chỉ �
 đang nắm data plane. Phần chặn `ethtool -G/-L` lúc đang claim thì **đã có sẵn** từ 2026-10-26
 (`0958a-...refuse-ring-and-channel-changes...`), không viết lại.
 
-Trạng thái: patch apply sạch (`Applying ... 0958b-... using plaintext`), build đang chạy
-(`build23-ram-round2.log`). Nạp vào **slot 0** máy thứ nhất (slot 1 đang giữ vòng 1 làm đường
-về). Sau khi nạp cần kiểm:
+Trạng thái: **build xong, EXIT=0** (`build23-ram-round2.log`). Patch apply sạch (`using
+plaintext`), và trong cùng build vẫn có `999-998` + cả hai `0958a-*` của kuncy7. Ảnh giữ ở
+`images-ramround2-343b135181/`. Bằng chứng code thật nằm trong kernel đã build: chuỗi
+`host RX rings not restored` có trong `vmlinux` (trong `sysupgrade.bin` thì không thấy vì kernel
+đã nén). Kernel config của ảnh: `# CONFIG_BPF_JIT is not set`, `CONFIG_PAGE_OWNER=y`.
+
+Chưa nạp — **cần anh đồng ý trước**. Dự định nạp vào **slot 0** máy thứ nhất (slot 1 đang giữ
+vòng 1 làm đường về). Sau khi nạp cần kiểm:
 
 - `page_owner_stacks` không còn hai stack `__init_dma_rx_desc_rings` 512 trang → được 4 MiB.
 - `dmesg | grep qca-dwmac` phải có "data plane claimed" cho cả hai GMAC và **không** có
