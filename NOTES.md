@@ -1713,6 +1713,104 @@ dùng:
 debug. So với 4 MiB của patch park RX và 2 MiB của tắt BPF JIT thì không đáng. Nếu sau này RAM
 căng thật, thứ đáng nhắm là **payload pool 15,3 MiB của NSS**, không phải swap.
 
+## 25. Cập nhật thượng nguồn 137 commit, dọn lịch sử `main`, và release `cr8806-nss-2026.11.07`
+
+### Thượng nguồn
+
+Không có remote `upstream`; thượng nguồn của cây này là `origin` = kuncy7/openwrt-nss-edma, nhánh
+`c3po-tag-8021q`. Lúc kiểm: **137 commit mới**, 275 file, +29.143/−1.640. Phần lớn không liên quan
+(backport driver DSA Motorcomm YT921x, realtek, airoha, busybox), **nhưng** có hai cái đụng đúng
+chỗ mình: `ea585ed832` đổi số thứ tự các giá trị DSA tag protocol ngoài cây, và `d1b5d4f8ec` mở
+rộng hook bridge VLAN của 0959b. Chỉ **3 file patch mình đang dựa vào** bị sửa:
+
+```
+M target/linux/qualcommax/patches-6.18/0955-net-dsa-tag_qca-add-a-variant-behind-an-ethertype.patch
+M target/linux/qualcommax/patches-6.18/0959-...-Airoha-AN8855.patch
+M target/linux/qualcommax/patches-6.18/0959b-net-dsa-retain-vlan-upper-filtering-for-vlan-taggers.patch
+```
+
+Không commit nào của mình đụng vào chúng, nên rebase `main` (6 commit) rồi rebase nhánh build (7
+commit) **sạch, không một xung đột**. `build28-upstream-1107.log` `EXIT=0`, và quan trọng nhất:
+**không một hunk nào fail** — cả `714-net-dsa-open-the-conduit...` và `0958b-net-stmmac-give-the-
+host-RX-buffers-back...` vẫn apply lên nền DSA mới. Kernel 6.18.55 → **6.18.60**.
+
+### Dọn lịch sử `main`
+
+Quyết định 2026-11-07: đưa 6 commit của nhánh build lên `main` rồi tag `main` (giống cách làm
+release 2026.10.27), thay vì tag tip một nhánh tên `ram-round2-nopageowner`. Ba việc đã làm:
+
+1. Bỏ tiền tố `TEST:` khỏi ba commit, và sửa phần thân nói "for testing only" / "to be tested".
+2. **Xoá hẳn cặp thêm-rồi-revert 999-998** (hai commit triệt tiêu nhau). Đã kiểm `git diff` giữa
+   nhánh build và `main` mới → **rỗng**, hai cây y hệt nhau.
+3. Dịch commit tắt BPF JIT sang tiếng Anh cho đồng bộ với phần còn lại của `main`.
+
+Trong commit 714 viết `openwrt/openwrt issue 26157` và `PR 26511` **không dấu `#`**, để không dán
+thêm reference event lên issue/PR của người khác (bài học mục 23).
+
+**Bảng đổi SHA** — những số cũ mà các mục trên còn nhắc tới:
+
+| mục nào nhắc | SHA cũ | giờ là |
+|---|---|---|
+| 0958b trả buffer RX (mục 21) | `94d1d1c23d` | `46b15a658e` |
+| cắt USB/ext4 (mục 24) | `157f92e5d6` | `7735441d3c` |
+| thêm 999-998 / revert nó (mục 23) | `560ff3143e` / `f7703924de` | **không còn trên `main`** |
+| `main` trước rebase | `0ee7daae5b` | `7735441d3c` |
+
+Hai commit 999-998 chỉ còn trong `backup/main-pre-rebase-20261107` và
+`backup/ram-round2-nopageowner-pre-rebase-20261107` (cả hai còn trong repo gốc), cộng nhánh
+`ram-round2-nopageowner` vẫn nguyên chưa xoá.
+
+### Một cái bẫy nữa: `DISTRIB_REVISION` đếm commit
+
+`getver.sh` sinh chuỗi `r<N>+<số commit>-<hash>`. Nhánh build có **150** commit tính từ
+`fb7e09acfe`, `main` sau khi xoá cặp 999-998 còn **148** — tức chuỗi nướng trong ảnh **khác nhau**,
+và ảnh của `build28` không còn khớp với tag. Phải build lại từ `main` đã dọn (`build29`, có
+`make package/base-files/clean` trước). Kết quả `r38363+148-fb7e09acfe`, đúng số.
+
+Và lưu ý con số **trông như đi lùi**: 2026.10.27 là `r38064+2`, các bản sáng nay `r38369+5`, bản
+này `r38363+148`. Không phải lùi: kuncy7 merge một nhánh có lịch sử sắp xếp lại, nên `getver.sh`
+chọn một commit cũ hơn làm mốc rồi đếm 148 commit trên nó.
+
+### Nạp và kiểm trước khi phát hành
+
+Nạp `images-release-20261107/` vào **slot 1 của máy thứ nhất** 2026-11-07 10:20
+(`flash-release-20261107-home1.log`). Đường về là slot 0 = bản sáng nay. Lưu ý điều này **ghi đè
+bản có 999-998** ở slot 1, nên nhánh B của phép A/B tại nhà giờ chỉ còn ở **máy thứ hai**.
+
+| kiểm | kết quả |
+|---|---|
+| lên slot mới sau reboot | 30 s |
+| `DISTRIB_REVISION` | `r38363+148-fb7e09acfe` |
+| `eth0` (patch 714, không hook preinit) | **1000Mb/s, Full, Link detected: yes** |
+| DSA / switch | `DSA: tree 0 setup`, rồi `qca-dsa-nss: firmware vlan nodes for tag_8021q DSA ports` và một vlan node cho mỗi cổng LAN |
+| VLAN 68/6/7, `lan1:t lan2:t lan3:u*`, ba SSID | đủ |
+| `nss_offload` | 1, cả hai radio `NSS 256 MiB: active` |
+| module usb/xhci/dwc3/ext4/jbd2/mbcache | **không còn cái nào** |
+| `iperf3` | không có |
+| `dmesg` lỗi | chỉ 3 dòng quen cũ (psci firmware bug, `rdinit=/init failed`, cảnh báo ECC `qcom_snand`) |
+| MemAvailable 1-2 phút sau boot | 44372 / 44448 kB, 1 client 5 GHz |
+
+Chính là chỗ mà 137 commit DSA có thể làm đổ — `tag_8021q` trên AN8855 — và nó không đổ.
+
+### Và một kết quả âm, phải ghi đúng
+
+MemAvailable lúc 1 phút: **44372 kB**, so với **44520 kB** của bản sáng nay (vẫn còn
+USB/ext4/iperf3). Tức ~800 KB module bỏ đi **không hiện ra thành lợi** — có vẻ kernel mới
+6.18.55→6.18.60 lấy lại. `lsmod` xác nhận module đã biến mất thật, nên cái mất là ở chỗ khác.
+Đừng ghi 800 KB đó vào cột lãi. Hai con số 4 MiB (park RX) và 2 MiB (BPF JIT) thì mỗi cái đã đo
+với nền riêng của nó và vẫn đúng.
+
+### Release
+
+**`cr8806-nss-2026.11.07`** — pre-release, tag trỏ `7735441d3c`, 7 asset (sysupgrade.bin,
+factory.ubi, initramfs.itb, manifest, config.buildinfo, feeds.buildinfo, sha256sums). `fork/main`
+đã force-push từ `0ee7daae5b` sang `7735441d3c` (dùng `--force-with-lease`).
+
+Release notes viết **tự chứa**: nhánh `notes` chưa push nên không link tới mục 20-25, mọi số liệu
+cần để đánh giá đều nằm trong trang release. Có cả phần "Not tested" nói thẳng: chưa soak, chưa
+cold boot, chưa đo throughput **trên bản này** (921 Mbit/s là đo trên nền cũ, ở máy thứ hai), chưa
+thử nhiều client, chưa đo lại roaming sau rebase.
+
 ## Việc còn lại
 
 - ~~PR 50: chạy ngắn cùng commit không profile để so `Frame OOR`, `Overflow`,
@@ -1755,7 +1853,8 @@ căng thật, thứ đáng nhắm là **payload pool 15,3 MiB của NSS**, khôn
   theo số đo ở đính chính lần hai. Còn lại: theo phản hồi reviewer, nhờ người có Redmi AX5400 /
   PZ-L8 kiểm chứng, và gửi bản `[PATCH net-next]` lên netdev. PR bỏ hook vào
   kuncy7/openwrt-nss-edma **hoãn** tới khi patch vào được `c3po-tag-8021q`.
-- 999-998: **đã revert 2026-11-07** (`f7703924de`, mục 23) sau báo cáo của người test. Phần đo
+- 999-998: **đã bỏ 2026-11-07** (mục 23; cặp thêm-rồi-revert bị xoá khi dọn lịch sử cho release,
+  xem mục 25 — `main` giờ đơn giản là không có nó). Phần đo
   RAM ở **mục 20** vẫn đúng (4,01 MiB cho cả hai radio) — chỉ là cái giá 4 MiB đó không mua được
   gì nếu nó chặn TX.
   **Nó nằm ở đâu (2026-11-06)**: có trong nhánh `ram-round1` đang chạy ở **slot 1 của máy thứ
@@ -1785,9 +1884,9 @@ căng thật, thứ đáng nhắm là **payload pool 15,3 MiB của NSS**, khôn
 
 | | máy thứ nhất | máy thứ hai |
 |---|---|---|
-| slot đang chạy | **slot 1** = `ram-round2-nopageowner` (bản sạch) | **slot 1** = cùng bản sạch |
+| slot đang chạy | **slot 1** = release `cr8806-nss-2026.11.07` (từ 2026-11-07 10:20) | **slot 1** = `ram-round2-nopageowner` |
 | slot còn lại | slot 0 = `ram-round2` + page_owner, là đường về | slot 0 = bản mesh mục 17, là đường về |
-| 999-998 | có (bản đang chạy; `f7703924de` bỏ nó, chưa nạp) | như máy thứ nhất |
+| 999-998 | **không** (slot 1 = release 2026.11.07) | **có** (chưa nạp lại) |
 | BPF JIT | tắt | tắt |
 | page_owner | tắt | tắt |
 | vai trò trong mạng | lá — được phép reboot/flash | nối máy chính xuống máy thứ nhất — **không** reboot khi đang test |
@@ -1810,7 +1909,7 @@ Wi-Fi: cùng SSID / cùng khoá hai máy, 802.11k + 802.11v chạy thật, ustee
    `*_desc_alloc_fail`, MemAvailable, `PDEV resets` — y như mục 15/16 đã làm với bản DSA.
 4. ~~**999-998 với nhiều client**~~ — **người test trả lời giúp 2026-11-07, xem mục 23**: 35
    client trên 2.4 GHz, và 5 GHz dừng ở ~200 Mbit/s với `tx_failed` không retry. Đã revert
-   999-998 (`f7703924de`). Việc còn lại đổi thành: **đo lại** throughput 5 GHz trên bản không
+   999-998 (mục 25). Việc còn lại đổi thành: **đo lại** throughput 5 GHz trên bản không
    999-998, và nếu vẫn ~200 Mbit/s thì tới 999-992 (một biến một lần).
 5. **`PDEV resets` 5 GHz**: `memlong.sh` đang ghi 10 phút một lần trên **cả hai** máy từ
    2026-11-06 20:21; cần vài ngày để so hai chuỗi. Nhớ nó **không** tự chạy lại sau boot — mỗi
