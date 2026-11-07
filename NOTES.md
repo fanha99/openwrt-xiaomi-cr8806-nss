@@ -1477,6 +1477,142 @@ Và nhắc lại cái đã biết: `wpa_key_mgmt` của SSID chính là
 `SAE FT-SAE WPA-PSK WPA-PSK-SHA256 FT-PSK`, tức `sae-mixed` — đúng cấu hình nằm trong giả thuyết
 còn lại về vì sao FT không hoàn tất (hostapd copy **PSK** vào `xxkey` khi `sm->pmksa` chưa gắn).
 
+## 23. Người test báo 999-998 chặn TX: trả lại pool link descriptor theo thượng nguồn
+
+Báo cáo nhận được 2026-11-07, từ người đang chạy bản có `ATH11K_NSS_MEM_PROFILE_256M` trên
+CR8806 thật, nhiều client hơn hai máy ở nhà rất nhiều:
+
+> On the first CR8806 AP running this build, the 2.4 GHz radio already serves 35 clients, above
+> the 32 the halved WBM idle link pool is sized for. The 5 GHz radio also tops out near
+> 200 Mbit/s to a wired iperf3 server (UDP 600 Mbit/s offered: NSS enqueues all of it without
+> drops, TQM receives about a third, the rest completes as tx_failed with no retries while the
+> channel is only 44% busy). Go back to the stock link descriptor pool (+2 MiB per radio) and
+> measure again.
+
+### Dấu vết nói gì
+
+Mất gói **giữa TCL và TQM**, không retry, kênh mới 44% busy: frame không hề lên sóng. Đó đúng là
+hình dạng của việc hết link descriptor — TQM lấy MSDU link descriptor từ WBM idle list, không lấy
+được thì frame bị release kèm trạng thái lỗi. Không phải giới hạn của radio, không phải nhiễu.
+999-998 chính là chỗ cắt một nửa cái list đó, nên nó là thứ phải bỏ trước.
+
+### Nhưng con số 35 > 32 **không** tự nó giải thích được
+
+`ath11k_wbm_idle_ring_setup()` cộng bốn nhóm rồi **làm tròn lên luỹ thừa của 2**, và chính phép
+làm tròn đó cho rất nhiều dư:
+
+| client | mpdu | queue | tx msdu | rx msdu | cần | pool sau làm tròn |
+|---|---|---|---|---|---|---|
+| 32 (999-998) | 1365 | 113 | 2340 | 5461 | 9279 | **16384** = 2 MiB |
+| 35 | 1493 | 124 | 2560 | 5973 | 10150 | 16384 |
+| 56 | 2389 | 199 | 4096 | 9557 | 16241 | 16384 |
+| 64 (thượng nguồn) | 2730 | 227 | 4681 | 10922 | 18560 | **32768** = 4 MiB |
+
+Tức pool bị cắt vẫn là 16384 descriptor, theo đúng công thức của driver thì đủ cho **56** client,
+chứ không phải 32. Nên nếu bỏ 999-998 mà hết triệu chứng thì cơ chế thật không phải "quá số
+client" mà là **độ sâu burst trên một pool dùng chung**: cả bốn nhóm rút từ cùng một WBM idle
+list, và `DP_AVG_*` chỉ là số trung bình, không phải trần. Cắt từ 32768 xuống 16384 là lấy đi
+phần dư mà phép làm tròn ở thượng nguồn vô tình tạo ra — 3,2 lần nhu cầu của 35 client còn 1,6
+lần. Đừng ghi lại bài học này thành "sizing cho 32 client là sai vì có 35 client".
+
+### Đã làm
+
+- Revert `560ff3143e` → commit `f7703924de` trên `ram-round2-nopageowner`, xoá hẳn file
+  `999-998-ath11k-nss-256m-link-descriptors.patch`. Nó độc lập: không patch nào khác tham chiếu
+  `ATH11K_NSS_256M_NUM_TIDS`, phần Kconfig help của 999-991 cũng không nhắc link descriptor.
+- Build lại: `build25-linkdesc-stock.log`, `EXIT=0` (có `make package/kernel/mac80211/clean`
+  trước, vì patch ath11k thay đổi). Kiểm trong log: 31 patch `nss-extra/ath11k` được apply và
+  **không** có 999-998; kernel config vẫn `# CONFIG_BPF_JIT is not set` /
+  `# CONFIG_PAGE_OWNER is not set`. Ảnh cất riêng ở `images-linkdesc-stock/`.
+- Nạp vào **slot 0 của máy thứ nhất** 2026-11-07 08:35 (`flash-linkdesc-stock-home1.log`), giữ
+  config. Ghi đè bản `ram-round2` + page_owner cũ ở slot 0; **slot 1 vẫn là
+  `ram-round2-nopageowner` có 999-998**, tức đường về và đồng thời là nhánh B của phép A/B. Máy
+  thứ hai không đụng tới. Sau khi nạp: `eth0` 1000Mb/s link yes, ba SSID lên, `nss_offload=1`,
+  cả hai radio báo `NSS 256 MiB: active`.
+- `iperf3 3.22` **có sẵn trong ảnh** (`CONFIG_PACKAGE_iperf3=y` từ trước, manifest dòng
+  `iperf3 - 3.22-r1`), không phải cài tay. Nó **không** nằm trong `keep.d` nên mất nếu flash bản
+  không có nó. Máy thứ hai cũng có.
+- `memlong.sh` cài lại và chạy lại (`start-stop-daemon -S -b -x /bin/sh -- /root/memlong.sh`;
+  `nohup ... &` qua ssh **không** sống sót khi phiên đóng, đã thử hai lần). Chuỗi 51 dòng của
+  bản cũ cất ở `soak-slot1-logs/home1-slot1-memlong.log`. Hai file `/root` có SSID/khoá
+  (`pre-sync-20261107/wireless.before-kv`, `roamcfg.log`) chuyển vào `private-backups/` mode 600.
+
+So RAM bằng chính `memlong.sh` trên cùng máy, cùng trường:
+
+| bản | uptime | MemAvailable |
+|---|---|---|
+| `ram-round2-nopageowner` (có 999-998) | 122 s | 46668 kB |
+| bản này (không 999-998) | 227 s | 43800 kB |
+
+Chênh 2,8 MiB, và bản này đọc muộn hơn 105 s (MemAvailable còn tụt tiếp lúc đầu) — khớp với 4 MiB
+trả lại trong phạm vi sai số. `/proc/vmallocinfo` đếm **6** vùng `dma-coherent` cỡ 2 MiB
+(2101248 B tính cả guard page): bank link descriptor cấp theo `DP_LINK_DESC_ALLOC_SIZE_THRESH` =
+2 MiB, nên thượng nguồn là 2 bank mỗi radio thay vì 1. `payfail` 25 so với 26 của bản cũ ở cùng
+mốc boot, tức không đổi.
+
+RAM: trả lại 4 MiB (2 MiB mỗi radio). Đúng bằng 4 MiB mà patch park RX ở mục 21 lấy về, nên so
+với bản đang chạy trên hai máy thì gần như đứng yên — mục 20 đo MemAvailable 36,9 MiB.
+
+### Đo thật 2026-11-07: không lặp lại được, và một mảnh bằng chứng của người test là ảo
+
+Topo: laptop (client 5 GHz 2×2 HE160) → AP chỉ bridge → backhaul dây → router chính → server
+iperf3 trên dây. Không AP nào kết thúc TCP, nên đây đúng là đường NSS. `iperf3` trên laptop cài
+**không cần root**: `apt-get download iperf3 libiperf0 libsctp1` rồi `dpkg -x` vào một thư mục
+riêng, chạy với `LD_LIBRARY_PATH` (thiếu `libsctp1` là nó báo không tìm thấy `libsctp.so.1`).
+
+Laptop lúc đó đang ở **máy thứ hai**, tức bản **CÓ 999-998** — đúng nhánh cần đối chứng:
+
+| phép đo (10 s, 4 luồng) | kết quả |
+|---|---|
+| TCP xuống (`-R`, AP truyền xuống client) | **921 Mbit/s**, 0 retransmit |
+| TCP lên | 788 Mbit/s, 490 retransmit |
+| `tx failed` của station trong lúc đo xuống | +28 trên +844k gói = 0,003% |
+| `wifili[0..2]_tx_desc_alloc_fail` / `ext_` / `rx_` | **0** hết |
+| `err ring pkts` | +374 |
+
+921 Mbit/s là **trần của dây gigabit**, không phải trần của Wi-Fi. Nghĩa là **có 999-998 vẫn đạt
+tốc độ dây**, và ~200 Mbit/s của người test không lặp lại được ở đây với một client nặng.
+
+**Và `tx retries` của ath11k ở đường NSS luôn bằng 0.** Trên cả hai máy, 6 station, 2,4 triệu gói
+và 720 lần `tx failed`, counter `tx retries` **không bao giờ** khác 0 — nó không được điền. Vì
+vậy câu "tx_failed with no retries" trong báo cáo **không chứng minh** được gói chưa lên sóng;
+rất có thể nó chỉ là counter chưa cài. Đây là mảnh bằng chứng tôi đã dựa vào để nói "đúng dấu vết
+hết link descriptor" ở trên — phải hạ xuống thành *không loại trừ được*, chứ không còn là dấu vết.
+
+Thêm một điểm phản bác chính giả thuyết: 2.4 GHz (`c000000.wifi`) và 5 GHz (`b00a040.wifi`) là
+**hai `ath11k_base` riêng** (hai thư mục debugfs `ahb-*`, hai dòng `NSS 256 MiB: active`,
+`ath11k_dp_alloc()` chạy một lần cho mỗi ab), nên mỗi radio có WBM idle list riêng. 35 client ở
+2.4 GHz **không** rút được descriptor của 5 GHz.
+
+Nhánh A (máy thứ nhất, **không** 999-998) chưa đo được: từ chỗ laptop đang ngồi,
+`netsh wlan show networks mode=bssid` chỉ thấy **một** BSSID cho SSID chính — của máy thứ hai.
+BSSID ch 36 của máy thứ nhất không hiện, tức ngoài vùng phủ. Muốn đo nhánh A phải mang laptop lại
+gần máy thứ nhất. Mà vì dây đã là trần ở 921 Mbit/s thì nhánh A cũng chỉ ra con số đó — nó chỉ
+còn giá trị kiểm tra không thụt lùi.
+
+**Giữ hay bỏ revert?** Giữ: nó trả lại đúng hành vi thượng nguồn, và 4 MiB đó đã được patch park
+RX ở mục 21 bù lại, nên không mất gì. Nhưng lý do phải ghi đúng: **chưa tái hiện được lỗi, một
+mảnh bằng chứng là ảo, và vẫn không loại trừ được** — chứ không phải "đã xác định 999-998 chặn
+TX".
+
+### Nghi phạm thứ hai, để dành cho vòng sau
+
+Nếu 5 GHz vẫn dừng ở ~200 Mbit/s sau khi bỏ 999-998 thì tới lượt
+**`999-992-ath11k-nss-256m-tx-descriptor-pools.patch`**: nó vừa hạ pool TX descriptor của NSS từ
+`ATH11K_WIFILI_DBDC_NUM_TX_DESC` = 8192 xuống 4096 mỗi radio, **vừa** kẹp
+`ath11k_nss_radio_buf_cfg()` từ `ATH11K_NSS_RADIO_TX_LIMIT_RANGE3` = 8192 xuống 4096 — tức trần
+buffer TX đang bay của mỗi radio cũng bị chia hai. Dòng boot `tx_desc=4096 tx_comp=4096` là nó.
+Điểm chống lại nghi phạm này: người test nói NSS nhận hết, không drop, mà hết pool TX descriptor
+thì phải thấy drop ngay ở chỗ enqueue. Vì vậy: **một biến một lần**, bỏ 999-998 trước, đo lại, rồi
+mới tính đến 999-992 (nó tiết kiệm ~2 MiB).
+
+### Lần sau nên xin người test số gì
+
+`ethtool -S` không có ở đường NSS, nên xin `cat /sys/kernel/debug/ath11k/*/htt_stats` với
+`stats_type` 1 (PDEV TX) và 5 (TX HWQ), cộng `tx_desc_alloc_fail`, `n2h_payload_alloc_fails` ở
+`/sys/kernel/debug/qca-nss-drv/stats/`, và số client của **từng** radio lúc đo. Hiện tại không có
+cách nào phân biệt "hết link descriptor" với "hết TX descriptor của NSS" từ dữ liệu đã nhận.
+
 ## Việc còn lại
 
 - ~~PR 50: chạy ngắn cùng commit không profile để so `Frame OOR`, `Overflow`,
@@ -1519,8 +1655,9 @@ còn lại về vì sao FT không hoàn tất (hostapd copy **PSK** vào `xxkey`
   theo số đo ở đính chính lần hai. Còn lại: theo phản hồi reviewer, nhờ người có Redmi AX5400 /
   PZ-L8 kiểm chứng, và gửi bản `[PATCH net-next]` lên netdev. PR bỏ hook vào
   kuncy7/openwrt-nss-edma **hoãn** tới khi patch vào được `c3po-tag-8021q`.
-- 999-998: đã đo lại ở **mục 20** (4,01 MiB cho cả hai radio, đúng như thiết kế). Còn lại:
-  thử nhiều client (điện thoại, laptop, IoT) để chắc 16384 link descriptor đủ.
+- 999-998: **đã revert 2026-11-07** (`f7703924de`, mục 23) sau báo cáo của người test. Phần đo
+  RAM ở **mục 20** vẫn đúng (4,01 MiB cho cả hai radio) — chỉ là cái giá 4 MiB đó không mua được
+  gì nếu nó chặn TX.
   **Nó nằm ở đâu (2026-11-06)**: có trong nhánh `ram-round1` đang chạy ở **slot 1 của máy thứ
   nhất**; **không** có ở máy thứ hai (và không có ở slot 0 làm đường về). Số liệu lẻ "4 client
   trong 4,7 h, mọi `*_desc_alloc_fail` = 0" ghi trước đó là **đường cơ sở của bản không có
@@ -1550,7 +1687,7 @@ còn lại về vì sao FT không hoàn tất (hostapd copy **PSK** vào `xxkey`
 |---|---|---|
 | slot đang chạy | **slot 1** = `ram-round2-nopageowner` (bản sạch) | **slot 1** = cùng bản sạch |
 | slot còn lại | slot 0 = `ram-round2` + page_owner, là đường về | slot 0 = bản mesh mục 17, là đường về |
-| 999-998 | có | có |
+| 999-998 | có (bản đang chạy; `f7703924de` bỏ nó, chưa nạp) | như máy thứ nhất |
 | BPF JIT | tắt | tắt |
 | page_owner | tắt | tắt |
 | vai trò trong mạng | lá — được phép reboot/flash | nối máy chính xuống máy thứ nhất — **không** reboot khi đang test |
@@ -1571,9 +1708,10 @@ Wi-Fi: cùng SSID / cùng khoá hai máy, 802.11k + 802.11v chạy thật, ustee
    thật — dự kiến quanh 45,7 MiB, so với 35,8 MiB của bản mesh.
 3. **Soak vòng 1 (+2)**: để chạy liền nhiều ngày, theo `n2h_payload_alloc_fails`,
    `*_desc_alloc_fail`, MemAvailable, `PDEV resets` — y như mục 15/16 đã làm với bản DSA.
-4. **999-998 với nhiều client**: 16384 link descriptor là cho 32 client. Phải có điện thoại +
-   laptop + đám IoT lên cùng lúc trên máy thứ nhất rồi xem `*_desc_alloc_fail` và `Frame OOR`.
-   Đây là phép thử duy nhất có thể làm 999-998 lộ ra là hạ quá tay.
+4. ~~**999-998 với nhiều client**~~ — **người test trả lời giúp 2026-11-07, xem mục 23**: 35
+   client trên 2.4 GHz, và 5 GHz dừng ở ~200 Mbit/s với `tx_failed` không retry. Đã revert
+   999-998 (`f7703924de`). Việc còn lại đổi thành: **đo lại** throughput 5 GHz trên bản không
+   999-998, và nếu vẫn ~200 Mbit/s thì tới 999-992 (một biến một lần).
 5. **`PDEV resets` 5 GHz**: `memlong.sh` đang ghi 10 phút một lần trên **cả hai** máy từ
    2026-11-06 20:21; cần vài ngày để so hai chuỗi. Nhớ nó **không** tự chạy lại sau boot — mỗi
    lần flash/reboot phải bật lại tay.
