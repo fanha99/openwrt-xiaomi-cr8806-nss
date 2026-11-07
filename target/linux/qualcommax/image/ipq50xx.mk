@@ -252,7 +252,9 @@ define Device/xiaomi_cr8806
 	NAND_SIZE := 128m
 	DEVICE_PACKAGES := \
 		ath11k-firmware-ipq5018-qcn6122 \
-		ipq-wifi-xiaomi_cr8806
+		ipq-wifi-xiaomi_cr8806 \
+		-kmod-usb3 -kmod-usb-dwc3 -kmod-usb-dwc3-qcom \
+		-kmod-fs-ext4 -e2fsprogs -losetup
 endef
 TARGET_DEVICES += xiaomi_cr8806
 
