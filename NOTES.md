@@ -1613,6 +1613,106 @@ mới tính đến 999-992 (nó tiết kiệm ~2 MiB).
 `/sys/kernel/debug/qca-nss-drv/stats/`, và số client của **từng** radio lúc đo. Hiện tại không có
 cách nào phân biệt "hết link descriptor" với "hết TX descriptor của NSS" từ dữ liệu đã nhận.
 
+## 24. Cắt USB, ext4 và iperf3 khỏi ảnh; và vì sao giữ `wpad-mesh-mbedtls`, bỏ `zram-swap`
+
+Máy không có cổng USB, mà DTS của nó (`target/linux/qualcommax/dts/ipq5018-cr8806.dts`) **không
+có node `usb` nào**. Dù vậy trên router vẫn thấy nạp đủ driver, toàn bộ **0 user**, và
+`/sys/bus/usb/devices/` rỗng — chúng nạp chỉ vì nằm trong `DEFAULT_PACKAGES` của target:
+
+| module | kích thước |
+|---|---|
+| `xhci_hcd` | 147 KB |
+| `dwc3` | 52 KB |
+| `dwc3_qcom`, `dwc3_qcom_legacy`, `xhci_pci`, `xhci_plat_hcd` | 57 KB |
+| **tổng USB** | **256 KB** |
+| `ext4` (0 user) + `jbd2` + `mbcache` | **540 KB** |
+
+`e2fsprogs`/`losetup`/`kmod-fs-ext4` cũng ở `DEFAULT_PACKAGES`, và chúng chỉ có nghĩa khi có ổ
+ngoài — không USB thì không có ổ ngoài. Bỏ cả. `iperf3` + `libiperf3` bỏ theo yêu cầu (512 KB
+flash); nhớ là **ảnh trước đó có sẵn iperf3 3.22**, nếu cần đo lại thì hoặc thêm lại vào build,
+hoặc cài qua `apk` sau khi nạp (`/root` và gói thêm đều bị `keep.d/nss-tools` xoá mỗi lần flash).
+
+### Cái bẫy: dấu `-` trong `DEVICE_PACKAGES` **không đủ**
+
+Thêm `-kmod-usb3 -kmod-usb-dwc3 -kmod-usb-dwc3-qcom -kmod-fs-ext4 -e2fsprogs -losetup` vào
+`DEVICE_PACKAGES` của `Device/xiaomi_cr8806`. Nó vào được metadata:
+
+```
+Target-Profile-Packages: ath11k-firmware-ipq5018-qcn6122 ipq-wifi-xiaomi_cr8806
+                         -kmod-usb3 -kmod-usb-dwc3 ... -losetup
+```
+
+**Nhưng ảnh vẫn có chúng.** `build26` vẫn chạy `(142/197) Installing kmod-usb3`, ảnh chỉ nhỏ đi
+đúng 512 KB của iperf3. Lý do: `filter_packages` (`include/target.mk`) chỉ áp lên danh sách
+profile, còn `DEFAULT_PACKAGES` của target đã biến thành `CONFIG_PACKAGE_x=y` lưu trong `.config`
+và cái đó thắng. Xoá hẳn mấy dòng đó rồi `make defconfig` thì chúng **quay lại `=y`**.
+
+Cách chạy được: ghi thẳng `# CONFIG_PACKAGE_<x> is not set` cho cả 7 gói USB (3 gói đầu + 4 gói
+phụ thuộc `kmod-usb-core`/`-common`/`-roles`/`-xhci-hcd`) và 3 gói storage, rồi `make defconfig`.
+Kconfig chốt lại thành **`=m`** — build thành gói nhưng **không cài vào ảnh**, đúng thứ cần.
+
+Giữ **cả hai**: dòng `-...` trong `ipq50xx.mk` (đúng ý nghĩa thiết bị, và có tác dụng với
+ImageBuilder hoặc khi sinh config mới) và `.config` tắt dứt khoát (cái này mới chặn ở build này).
+
+Kết quả `build27-nousb-noiperf.log`, `EXIT=0`:
+
+| | trước | sau |
+|---|---|---|
+| gói trong manifest | 197 | **187** |
+| `sysupgrade.bin` | 16.814.351 B | **16.240.911 B** |
+| grep `usb|iperf|ext4|e2fsprogs|losetup` trong manifest | 10 dòng | **0** |
+
+`fstools` và `mtd` vẫn còn (cần cho overlay UBIFS và sysupgrade); `block-mount` chưa bao giờ được
+cài. Ảnh cất ở `images-nousb-noiperf/`. **Chưa nạp** — dự kiến lấy lại ~800 KB module memory,
+phải nạp mới đo được. Muốn hoàn lại thì xoá ba chữ `-kmod-fs-ext4 -e2fsprogs -losetup` và bật lại
+`=y` trong `.config`.
+
+Kernel vẫn còn `CONFIG_USB=y` built-in (usbcore đăng ký 3 interface driver lúc boot). Tắt nó là
+thay đổi `target/linux/qualcommax/config-6.18`, tức **toàn target** — mà GL-X2000 cùng subtarget
+ipq50xx thì có USB thật (`kmod-usb-net-qmi-wwan`). Không làm, cái giá còn lại rất nhỏ.
+
+### `wpad-mesh-mbedtls`: giữ nguyên
+
+`wpad` = một binary chứa **cả `hostapd` (phía AP) và `wpa_supplicant` (phía station)**; trên
+router nó được symlink thành hai chỗ nên `ps` thấy hai process riêng. Tên gói có hai trục: hậu tố
+crypto (`-mbedtls`/`-openssl`/`-wolfssl`/không có = crypto nội bộ) và mức tính năng
+(`mini` < `basic` < `mesh` < `full`).
+
+Đọc `package/network/services/hostapd/Makefile`: variant `mesh` đặt `CONFIG_VARIANT:=full`, tức
+dùng **đúng template cấu hình của full** rồi thêm `CONFIG_AP=y CONFIG_MESH=y CONFIG_WPS_NFC=1`,
+nhưng không thêm những thứ chỉ `full` có (`OWE`, `SUITEB192`, `EAP_PWD`, `DPP`/`DPP2`).
+
+Hạ xuống `wpad-basic-mbedtls` (gói 570 KB thay vì 859 KB) **không được**:
+
+```
+hostapd-basic.config:162:  #CONFIG_WNM=y     <- bị comment
+hostapd-full.config:162:    CONFIG_WNM=y
+```
+
+`CONFIG_WNM` chính là 802.11v BSS Transition Management, tức `bss_transition` đã bật cho cả ba
+SSID ở mục 22. 802.11r thì basic **có** (`CONFIG_IEEE80211R=y` ở cả hai file), 802.11v thì không.
+Và 290 KB chênh lệch gần như không tốn RAM: text được demand-page thẳng từ squashfs, phần code
+EAP/WPS không ai gọi thì không vào RAM. RSS thật lúc chạy: `hostapd` 4176 kB,
+`wpa_supplicant` 3472 kB. → `wpad-mesh-mbedtls` là variant nhỏ nhất còn có WNM, giữ.
+
+### `zram-swap`: không thêm
+
+Gói ở `package/system/zram-swap`, cần thêm `kmod-zram` + thư viện nén: nó tạo một block device
+nén trong RAM rồi `swapon`, trang bị swap ra được nén 2-3:1 và vẫn nằm trong RAM. Ba lý do không
+dùng:
+
+1. Áp lực RAM ở đây là **bộ nhớ kernel không swap được**: DMA coherent (link descriptor),
+   `page_pool` RX của hai GMAC, payload pool NSS 15,3 MiB, buffer CE. Swap chỉ nhận trang
+   anonymous của userspace.
+2. Userspace bé tí: đo trên router `AnonPages: 5960 kB`. Đó là **trần tuyệt đối** của những gì
+   zram có thể nén; nén nửa ở 3:1 thì lãi ~2 MiB.
+3. Khi cạn bộ nhớ DMA coherent, kernel **OOM trong lúc swap vẫn trống** — zram không che được
+   đúng chế độ lỗi mình đang lo.
+
+Đổi lại là metadata zsmalloc, CPU nén/giải nén trên đường nóng, và một tầng nữa phải loại trừ khi
+debug. So với 4 MiB của patch park RX và 2 MiB của tắt BPF JIT thì không đáng. Nếu sau này RAM
+căng thật, thứ đáng nhắm là **payload pool 15,3 MiB của NSS**, không phải swap.
+
 ## Việc còn lại
 
 - ~~PR 50: chạy ngắn cùng commit không profile để so `Frame OOR`, `Overflow`,
