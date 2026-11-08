@@ -45,8 +45,22 @@ board PR review. The measuring scripts are in [`tools/`](https://github.com/fanh
   `files/` overlay: OpenWrt defaults, no root password, Wi-Fi off,
   LAN 192.168.1.1.
 
-`main` is kuncy7's `c3po-tag-8021q` plus two commits:
+`main` is kuncy7's `c3po-tag-8021q` plus a dozen commits. The ones that change
+how the board behaves:
+- **Both DSA conduits in use**, since `cr8806-nss-2026.11.08`: the `wan` port
+  rides the second CPU port (`eth0`) and the three `lan` ports stay on `eth1`,
+  so a routed flow crosses one conduit per direction instead of the same one
+  twice. A single conduit is a hard ceiling of 927-929 Mbit/s bidirectional;
+  two give 1104-1458. Two DSA fixes are carried here to make it work: one opens
+  the conduit of a PHY-to-PHY CPU link (openwrt/openwrt#26511), the other stops
+  a standalone port's tag_8021q VLAN from being given to every CPU port, which
+  used to flood every routed frame to both of them.
+- `nss-tools` arms every GMAC that DSA gave user ports, so the firmware mask
+  comes out right on a board whose `wan` hangs off the second CPU port.
 - The ath11k 256M NSS memory profile on by default for the CR8806.
+- About 6.8 MiB of memory back: the host releases its RX buffers while the NSS
+  firmware owns a GMAC, the BPF JIT is off, and USB and ext4 are out of the
+  image.
 - The feeds pinned to the revisions the images are built from.
 
 The 1024-entry RXDMA ring for the 5 GHz QCN6122 radio (the 2.4 GHz radio
