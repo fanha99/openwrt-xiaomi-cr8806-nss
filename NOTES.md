@@ -1811,7 +1811,870 @@ cần để đánh giá đều nằm trong trang release. Có cả phần "Not t
 cold boot, chưa đo throughput **trên bản này** (921 Mbit/s là đo trên nền cũ, ở máy thứ hai), chưa
 thử nhiều client, chưa đo lại roaming sau rebase.
 
+## 26. Hai GMAC, một con switch: conduit là gì, cái bug DSA chặn conduit thứ hai, và patch
+
+Mục này trả lời một câu hỏi tưởng đơn giản mà hoá ra là gốc của cả mục 16 và mục 18: **cổng WAN
+"chạy trên eth nào", tách nó ra khỏi LAN thì được gì, và vì sao thượng nguồn tắt hẳn CPU port thứ
+hai.** Kết thúc bằng một patch DSA, một PR gửi kuncy7 và một release. Kết luận sau ba ngày đo, theo
+thứ tự quan trọng:
+
+1. **Một conduit trần ~930 Mbit/s routed, tính cả hai chiều cộng lại** — vì một frame routed qua
+   conduit của nó hai lần.
+2. **Bật CPU port thứ hai trong DTS mà để nguyên là tai hoạ**: không mang cổng nào, không được
+   arm, vẫn tốn 932 → 723 Mbit/s và trọn một core (softirq cpu0 91%). Nên `a67d696c5d` của thượng
+   nguồn **đúng** — đúng cả thay đổi lẫn cơ chế nó nêu, với cấu hình mặc định.
+3. **Nhưng cái tai hoạ đó là một bug của DSA, sửa được** — và sửa rồi thì hai conduit **phá được
+   trần**: trần một conduit là 927–929 Mbit/s hai chiều (ba lượt lệch 2 Mbit/s), hai conduit cho
+   **1104–1458** — luôn vượt, tán rộng là vì máy đo chứ không phải router — với softirq ~2,5% và
+   ECM accelerate 9 flow. Nguyên nhân là `dsa_port_tag_8021q_vlan_match()` cho **mọi** CPU port làm
+   member của **mọi** VLAN tag_8021q, nên traffic của một cổng standalone bị nhân sang CPU port thứ
+   hai. Sửa đúng là một patch DSA, 1 hàm + 2 helper — xem "Patch DSA: viết, build, nạp, đo". Chưa
+   có patch thì workaround là cho cổng standalone vào một bridge VLAN-aware ("Phá trần lần đầu").
+
+Mục này ghi lại cả chuỗi kết luận sai của tôi trên đường tới đó, vì chúng sai lặp cùng một kiểu.
+
+### Sơ đồ thật của board
+
+Bốn cổng RJ45 (3 LAN + 1 WAN) **không** phải bốn card mạng. Cả bốn đều là cổng của một con switch
+QCA8337. SoC IPQ5018 có hai MAC, nối vào con switch đó bằng hai đường vật lý khác nhau:
+
+```
+              ┌─ port 1 ── LAN1
+              ├─ port 2 ── LAN2
+              ├─ port 3 ── LAN3
+   QCA8337 ───┤
+              ├─ port 4 ── WAN (jack)
+              │
+              ├─ port 0 ──── SGMII 1G ─────────────── GMAC1 = eth1
+              └─ port 5 ──── PHY4 ↔ GE PHY (PHY-to-PHY) ── GMAC0 = eth0
+```
+
+`port 0` và `port 5` là hai **CPU port**. Trong DSA, MAC của SoC mà frame của một cổng người dùng
+đi qua để lên CPU gọi là **conduit** của cổng đó (tên cũ: master). Mỗi cổng RJ45 được gán một
+conduit, và gán ở hai chỗ:
+
+- `board.d/02_network` lúc first boot → `ucidef_set_network_device_conduit`, ra `option conduit`
+  trong `/etc/config/network`;
+- lúc chạy: netlink `IFLA_DSA_CONDUIT` (netifd làm thay).
+
+**Mặc định trong cây này:** cả 4 cổng → `eth1`. `eth0` không ai dùng.
+
+**Cấu hình của máy thứ nhất (và thứ hai):** `lan1-3` → `eth1`, `wan` → **`eth0`**. Trong
+`/etc/config/network` là `option conduit 'eth0'` ở device `wan`, và kiểm được bằng
+`/sys/class/net/eth0/upper_wan`. Dòng đó do một lần first boot cũ viết ra và **không tự sinh lại**
+(xem mục 18), nên nó theo cấu hình qua mọi lần flash giữ config.
+
+### Vì sao eth0 cần patch 714 (nối mục 16)
+
+`port 5` không nối thẳng vào GMAC0: nó đi qua **PHY4 của switch ↔ GE PHY trong SoC**, hai con PHY
+nối lưng nhau, không có MAC nào ở giữa. Hệ quả về thời gian:
+
+- DSA bật PHY4 ngay lúc probe (~2,2 s), PHY4 bắt đầu autoneg;
+- GE PHY chỉ được khởi tạo khi **eth0 được open** (`stmmac_open` → `phylink_fwnode_phy_connect`);
+- nếu sau ~13 s PHY4 không thấy đối tác quảng bá 1000BASE-T, nó **bỏ gigabit** và link không lên.
+
+Nên nếu không ai mở eth0 sớm thì **eth0 không có carrier**, và nó không dùng được làm conduit.
+Hook `05_cr8806_eth0_up` (`ip link set eth0 up`) và sau đó patch 714 (DSA tự mở conduit của một
+CPU port kiểu PHY-to-PHY, trước `dsa_shared_port_phylink_register()`) đều chỉ làm **một** việc:
+mở eth0 đủ sớm. Chúng **không** phải là cái "tách WAN" — việc tách là do `conduit 'eth0'`.
+
+### Thượng nguồn 2026-11-07: tắt hẳn port 5
+
+PR kuncy7/openwrt-nss-edma 63 (merge 09:27 ngày 2026-11-07) mang **3 commit**:
+
+| commit | nội dung |
+|---|---|
+| `99c4508138` | thêm profile `xiaomi_redmi-ax3000-ubootmod`; tách `ipq5018-cr8806.dts` → `ipq5018-cr880x.dtsi` dùng chung |
+| `a67d696c5d` | **`status = "disabled"` cho `ethernet-port@5`** trên toàn bộ CR880x + xoá `05_cr8806_eth0_up` |
+| `f3588d3871` | thêm profile mới vào CI group 256m |
+
+Lý do của `a67d696c5d` là issue 66 (Cathgao, đã close): `qca8k_setup()` ghi `GLOBAL_FW_CTRL1` với
+destination mask = `dsa_cpu_ports(ds)`, tức **tất cả** CPU port. Có hai CPU port thì mọi frame
+unknown-unicast / broadcast / multicast được switch nhân bản sang **cả hai**. Trên máy anh ấy
+(cấu hình mặc định: 4 cổng đều ở eth1, eth0 lên link nhờ hook nhưng không mang cổng nào), frame
+đến eth0 → `dsa_conduit_find_user()` không tìm được cổng người dùng nào → drop trong softirq:
+CPU0 softirq **30-60%** khi iperf3 routed, dmesg đầy `eth0: dropped frame ... src_port=-1`. Tắt
+port 5 thì về 0%.
+
+Diff đã kiểm: `ipq5018-cr880x.dtsi` so với `ipq5018-cr8806.dts` cũ **giống từng dòng**, chỉ khác
+hai chỗ — bảng `qcom,smem-part` ở lại file board, và `ethernet-port@5` thêm `status = "disabled"`.
+Tức với CR8806 **thay đổi chức năng duy nhất là tắt port 5**. Tên profile (`xiaomi_cr8806`),
+`board_name`, model string, compatible sysupgrade, tên file ảnh: **không đổi gì**. "cr880x" chỉ là
+tên file DTS dùng chung.
+
+### Hệ quả cho cây này
+
+- `eth0` **không còn là conduit**: `qca8k` chỉ đăng ký port 0. Dòng `option conduit 'eth0'` ở
+  device `wan` thành vô nghĩa — kernel từ chối, `wan` rơi về conduit mặc định `eth1`. Nên dọn.
+- Override `nss.general.fw_mask=0x3` (mục 18) **hết cần**: eth0 không mang cổng nào nữa, giá trị
+  dẫn xuất đúng là `0x2`. Bug `nss_dsa_fw_mask()` bỏ sót GMAC mang cổng WAN **vẫn là bug** cho
+  AX5400 / PZ-L8 (board.d của chúng đặt wan ở eth0), chỉ là CR880x không còn chạm vào nó.
+- Patch 714 vẫn apply sạch nhưng **thành no-op trên CR880x**: không còn CPU port PHY-to-PHY nào
+  để mở. Nó vẫn đúng và vẫn cần cho upstream — AX5400 và PZ-L8 có wan ở eth0 từ board.d nên
+  **không** tắt được port 5 ở đó. Nhưng board duy nhất trong cây này minh hoạ được vấn đề thì nay
+  không minh hoạ nữa; nếu reviewer PR 26511 hỏi "sao không tắt port đi cho xong" thì đó là câu
+  trả lời.
+- Commit `qualcommax: ipq50xx: drop the CR8806 eth0-up preinit hook` của mình bị git **drop khi
+  rebase** ("patch contents already upstream") — thượng nguồn đã xoá đúng file đó.
+
+### Đo: cái giá của một CPU port thứ hai
+
+Lý do duy nhất đáng cân nhắc khi tách conduit là thông lượng **routed** (LAN ↔ WAN, phải lên CPU
+vì khác L3 domain; traffic bridged trong LAN thì switch tự chuyển, không lên CPU). Nên phải đo
+routed, và trước ngày 2026-11-07 **chưa bao giờ đo** — xem "Vì sao mấy tuần không thấy" ở dưới.
+
+**Cách đo.** Cùng một sợi cáp, cùng cổng, cùng vị trí. Đường đo toàn bộ là dây: laptop (card
+Ethernet) → jack WAN → Home1 routed+NAT → cổng lan → router chính → một host gigabit có dây làm
+iperf3 server (đường sau Home1 là switch cứng toàn tuyến). 20 s, 4 luồng, `iperf3.exe` chạy
+**trên Windows** với `-B <địa chỉ card Ethernet>` — iperf3 trong WSL không ép được route vì WSL
+nằm sau NAT của Windows; có `-B` thì không cần tắt Wi-Fi. Phép NAT dùng một zone riêng cho cổng
+WAN + masq ở zone lan. Mỗi phép đo tự đọc **trong lúc chạy**: `/sys/class/net/wan/speed`,
+`ls /sys/class/net/eth*/upper_*` (conduit của từng cổng), `ethtool -S eth0|eth1` (MMC), `/proc/stat`
+(softirq), và `accelerated_count` của ECM.
+
+Hai đợt đo, khác nhau ở một chỗ quan trọng:
+
+- **Đợt 1 (2026-11-07 tối), nhánh `port5-ab`** = `main` + một commit `TEST:` xoá dòng
+  `status = "disabled"`. Đổi `fw_mask` bằng cách **ghi debugfs lúc đang chạy**.
+- **Đợt 2 (2026-11-08 khuya), nhánh `port5-2conduit`** = `main` + bật port 5 + lấy lại patch 714 +
+  `CONFIG_PACKAGE_ip-bridge=y`. Đổi `fw_mask` bằng **uci + reboot**.
+
+Khác biệt ấy hoá ra quyết định: **ghi `fw_mask` lúc đang chạy không arm nổi một GMAC mới** (xem
+dưới), nên mọi dòng `0x3` của đợt 1 **chưa bao giờ thật sự là hai conduit**. Bảng dưới là đợt 2,
+và nó là bảng duy nhất đáng tin.
+
+| # | port 5 | eth0 | `fw_mask` | conduit `wan` | up / down / bidir (Mbit/s) | softirq cpu0/cpu1 | eth0 MMC RX |
+|---|---|---|---|---|---|---|---|
+| 1 | **tắt** (`a67d696c5d`) | — | 0x2 | eth1 | **932** / 920 / 859+71 | 0,3% / 1,8% | — |
+| 2 | bật | up, `idle` | 0x2 | eth1 | **723** / — / — | **98,3%** / 3,3% | **1.675.825 fr** |
+| 3 | bật | up, `idle` | 0x2 | **eth0** | 80 / — / — | 93,5% / 53,1% | 192.424 |
+| 4 | bật | **`started`** | **0x3** | **eth0** | 111 / 211 / 113 | 95,9% / 60,8% | 192.928 |
+| 5 | bật | **`started`** | **0x3** | eth1 | 95 / 209 / 104 | 97,0% / 97,8% | 417.786 |
+
+**Phép A/B sạch nhất là dòng 1 so dòng 2.** Khác đúng **một** biến — port 5 bật trong DTS. Cấu
+hình phía trên y nguyên: bốn cổng đều trên eth1 (`eth1 upper: lan1 lan2 lan3 wan`, `eth0 upper:`
+rỗng), `fw_mask=0x2`, eth0 **không được arm** (`phys_if 0: idle dev=eth0 (not in fw_mask)`). Kết
+quả: **932 → 723 Mbit/s**, softirq cpu0 **0,3% → 98,3%**.
+
+Và eth0 — không mang cổng nào, không được arm — **nhận một bản sao gần như nguyên vẹn của chiều
+ingress**:
+
+```
+eth0 MMC RX  1.675.825 frame  (82.009 pps)   TX 0
+eth1 MMC RX  1.676.403 frame                  ← lệch 0,03%
+```
+
+**Frame đó đi đâu: 1,25 triệu frame mất mà không counter nào đếm.** Trong cùng cấu hình, đọc song
+song counter phần cứng và counter netdev của eth0:
+
+```
+eth0 MMC RX   1.689.405 frame     ← phần cứng MAC nhận
+eth0 netdev     444.197 packet    ← stack chỉ lấy lên được ~1/4
+rx_dropped 0   rx_errors 0   mmc_rx_fifo_overflow 0   mmc_rx_crc_error 0
+```
+
+Đúng chữ *"millions of dropped frames"* trong commit message của Cathgao, và đúng cả bậc độ lớn
+*"up to 50% CPU softirq"* — ở đây là 98,3% của một core trên hai core.
+
+**Đối chứng quyết định: routed so với kết thúc trên router.** Cùng máy, cùng cấu hình dòng 2, chỉ
+đổi **loại** traffic:
+
+| traffic | eth1 MMC RX | eth0 MMC RX |
+|---|---|---|
+| routed (laptop ở jack WAN → host sau router chính), 20 s | 1.676.403 fr | **1.675.825 fr** |
+| kết thúc **trên** router (dropbear sink, ingress lan2, ~600 Mbit/s), 30 s | +414.542 fr | **+0 fr** |
+
+Biến quyết định **không** phải "eth0 có mang cổng hay không", và cũng không hẳn là "routed so với
+terminated" như tôi viết lúc đầu: đó là **frame đi qua conduit trong VLAN nào**. Luồng routed trong
+rig này đi qua cổng `wan`, một cổng standalone, nên frame của nó qua conduit trong VID 3076 của
+tag_8021q; luồng terminated đi qua `br-lan`, một bridge VLAN-aware, nên frame của nó mang VID
+6/7/68 của chính bridge. DSA cấp hai loại VLAN đó cho **hai tập CPU port khác nhau** — và đó là
+toàn bộ cơ chế.
+
+### Cơ chế, đọc thẳng từ thanh ghi (2026-11-08)
+
+Đọc được **không cần patch, không cần build, không cần reboot**. `qca8k` không có debugfs riêng,
+nhưng nó dùng regmap, và kernel này có `CONFIG_DEBUG_FS=y` + `CONFIG_REGMAP=y`, nên regmap tự tạo
+`/sys/kernel/debug/regmap/90000.mdio-1:11/registers`: toàn bộ không gian thanh ghi của QCA8337,
+`cat` ra được. (`90000.mdio-1:11` = bus MDIO, địa chỉ 0x11 = 17 = con switch.) Chỉ đọc phần dưới
+0x1000 — từ 0x1000 lên là MIB, và đó là chính mấy counter đang dùng để đo. `head -c 4096` là đủ
+tới 0x718.
+
+| thanh ghi | giá trị | nghĩa |
+|---|---|---|
+| `GLOBAL_FW_CTRL1` 0x624 | `3f3f3f3f` | đích flood UC/MC/BC/IGMP đều `0x3f` = cổng 0..5, **có port 5** |
+| `PORT_LOOKUP_CTRL(0)` 0x660 | `0004031e` | member `0x1e` = {1,2,3,4}; STATE=FORWARD; LEARN=0 |
+| `PORT_LOOKUP_CTRL(2)` 0x678 | `0014030b` | member {0,1,3}; STATE=FORWARD; **LEARN=1** (`lan2`, cổng bridge) |
+| `PORT_LOOKUP_CTRL(4)` 0x690 | `00040301` | member {0}; STATE=FORWARD; **LEARN=0** (`wan`, standalone) |
+| `PORT_LOOKUP_CTRL(5)` 0x69c | `00040300` | member **rỗng**; STATE=FORWARD; LEARN=0 (port 5) |
+
+Bố cục bit: `MEMBER` = GENMASK(6,0), `VLAN_MODE` = (9,8) (ở đây `3` = SECURE), `STATE` = (18,16),
+`LEARN` = BIT(20) — `qca8k.h:266`.
+
+Hai điều đọc ra ngay: port 5 **có** nằm trong đích flood, đúng như `a67d696c5d` nói; nhưng port 5
+**không** nằm trong member mask của bất kỳ cổng nào, kể cả của CPU port 0. Nên member mask một
+mình **không** giải thích được 1,68 triệu frame mà eth0 đã nhận.
+
+`0x3f` ở cả bốn trường là do `qca8k_setup()` ghi `dsa_cpu_ports(ds)` (`qca8k-8xxx.c:2476`), rồi
+`qca8k_write_flood_masks()` (`qca8k-common.c:724`) OR thêm user port vào khi tagger là 8021q. Chỗ
+ghi `dsa_cpu_ports(ds)` đến từ patch `711-02-net-dsa-qca8k-enable-flooding-to-both-CPU-port.patch`
+(Christian Marangi, *"To permit a multi-CPU setup"*), và **đã kiểm xong nguồn gốc**: đó là patch
+**generic pending của chính OpenWrt**, nằm trong `target/linux/generic/pending-*` từ 6.1, do các
+commit bump kernel của OpenWrt mang theo (`8a9273d51e` Weijie Gao, `480537ed36`, `b70d9a15af`
+Mieczyslaw Nalewaj). **Không** phải thứ riêng của cây NSS — lần trước tôi kết luận ngược vì
+`9716066e80` (Rosen Penev, cây NSS) có chạm file này, nhưng đó là `M`, không phải `A`. Nên mọi
+target OpenWrt có hai CPU port bật trong DT đều ở trong tình trạng này.
+
+Patch ấy ghi kèm một điều kiện: *"Each CPU port should have correct LOOKUP MEMBER configuration to
+prevent receiving duplicate packets from user ports"*. Điều kiện đó **đang được thoả** — member
+mask không chỗ nào có port 5 — mà frame vẫn bị nhân. Tức điều kiện ấy chưa đủ, vì đường vào là
+VLAN chứ không phải member mask.
+
+Hai phép đối chứng tại chỗ, không cần rig, trên đúng cấu hình đã đo 723 Mbit/s:
+
+- 20 s LAN nhà bình thường: eth1 MMC RX **+137** frame (broadcast/multicast của nhà), eth0 **+0**.
+- 50 frame unknown unicast do chính router phát vào `br-lan.68` (`ip neigh` trỏ tới một MAC không
+  ai sở hữu, rồi ping): eth1 MMC TX tăng, eth0 **+0**.
+
+### Phép thử ba chân, chứng minh trực tiếp (2026-11-08, cáp WAN đã cắm)
+
+Không cần iperf3, không cần build mới. Cách bơm: `ip neigh` trỏ một IP tới **một MAC không ai sở
+hữu**, rồi `ping -c 20 -s 60000` — mỗi echo request phân mảnh thành ~41 frame nên 20 ping cho ~820
+frame unknown unicast, phát trong ~20 s. Frame đi từ CPU port 0 ra, đúng chiều mà luồng routed
+đi ra `wan`. Ba chân chạy cách nhau vài giây trên cùng một máy, cùng một đích MAC, chỉ khác **một**
+biến: VLAN mà frame mang khi qua conduit.
+
+| chân | cổng egress | VLAN qua conduit | frame ra eth1 (TX) | **eth0 nhận (RX)** |
+|---|---|---|---|---|
+| **A** | `wan`, standalone | **VID 3076** (tag_8021q) | +917 | **+825** |
+| **B** | cổng trong bridge VLAN-aware | VID của bridge | +920 | +4 (nhiễu nền) |
+| **C** | `wan`, **đã cho vào bridge VLAN-aware** | **VID 1** (VID của bridge) | +924 | **+0** |
+
+Chân C là phép thử quyết định: cho `wan` vào một bridge có `vlan_filtering 1` lúc đang chạy
+(`ip link add brwt type bridge vlan_filtering 1`, `ip link set wan master brwt`). Node của
+`qca-dsa-nss` đổi từ `vid=3076` sang **`vid=1`** ngay, `GLOBAL_FW_CTRL1` vẫn `3f3f3f3f`, member
+mask của port 0 vẫn `0x1e` (vẫn không có port 5) — **không một mask nào đổi**, chỉ VLAN đổi, và
+eth0 từ +825 xuống **+0**. Đích vẫn là một MAC không ai sở hữu nên frame ở chân C **vẫn là unknown
+unicast**: biến duy nhất bị đổi là VLAN.
+
+Một hiệu ứng phụ đọc được ở chân C: `PORT_LOOKUP_CTRL(4)` đổi `00040301` → `00140301`, tức
+**LEARN bật** khi cổng vào bridge. Với traffic thật (MAC đầu xa có tồn tại) thì đó là **lý do thứ
+hai** để flood tắt — MAC đầu xa vào được ATU nên frame thành known unicast. Hai cơ chế, cùng một
+thay đổi chữa cả hai.
+
+### Xác nhận lại bằng traffic routed thật (2026-11-08, 3 lượt iperf3)
+
+Rig: laptop ở jack WAN (cổng `wan`, standalone) là iperf3 client, `iperf3 -s` trên một host ở LAN,
+`-t 20 -P 4`, hướng wan → lan. Sampler 1 giây/mẫu; window 20 s bận nhất trong 180 mẫu:
+
+| | |
+|---|---|
+| eth1 MMC RX | +1.677.515 frame |
+| eth1 MMC TX | +2.219.016 frame |
+| **eth0 MMC RX** | **+1.687.067 frame** (eth0 TX = 0) |
+| lệch eth0 / eth1 RX | **+0,569%** |
+| softirq cpu0 | **91,0%** (cpu1 3,6%) |
+| ECM accelerated trong lúc chạy | **5** (lấy mẫu 4 lần trong window, đều 5) |
+| iperf3 báo | 610–690 Mbit/s tổng, phân bố 4 luồng rất lệch (320/172/59/139) |
+
+Khớp theo từng giây, không chỉ theo tổng: eth1 RX 88.264 / eth0 RX 88.035; 91.036 / 92.117;
+94.536 / 93.409; 81.612 / 82.387. Và lúc rỗi thì eth0 **đứng yên hoàn toàn** trong khi eth1 vẫn
+nhúc nhích — đối chứng nằm ngay trong cùng một file mẫu.
+
+Thanh ghi đọc ở giây 20 và giây 40 **giữa lúc tải chạy**, không đổi một bit so với lúc rỗi:
+
+```
+0624: 3f3f3f3f   0660: 0004031e   0678: 0014030b   0690: 00040301   069c: 00040300
+```
+
+Đó là câu trả lời cho việc "so mask giữa cảnh terminated và cảnh routed": **mask không đổi**. Tải
+không lập trình lại gì cả — nên khác biệt phải nằm ở lookup của từng frame, và nó nằm ở VLAN.
+
+Hai điều đáng ghi thêm từ lượt này:
+
+- **ECM vẫn accelerate bình thường** (5 connection) với `fw_mask=0x2` và port 5 bật. Tức flood
+  **không** làm sập offload; cái làm sập offload là `fw_mask=0x3` (mục trên). Hai bệnh khác nhau.
+- **eth1 TX nhiều hơn eth1 RX 541.501 frame.** Với một luồng routed qua cùng một conduit thì RX và
+  TX lẽ ra bằng nhau (mỗi frame vào một lần, ra một lần). Phần dư xấp xỉ bằng số frame ACK, và
+  cũng xấp xỉ phần bản sao mà stack lấy lên được từ eth0 (lượt trước: MMC 1,69 triệu so với netdev
+  444 nghìn, ~26%). **Chưa giải thích được** — giả thuyết chưa kiểm là stack nhận bản sao trên
+  eth0 rồi **forward nó lần thứ hai**. Cách chốt rẻ: lấy mẫu `/sys/class/net/eth0/statistics/rx_packets`
+  song song và xem nó có khớp phần dư TX hay không.
+
+**Nên đây vừa là chứng minh vừa là workaround**: board nào không tắt được CPU port thứ hai thì cho
+cổng standalone vào một bridge VLAN-aware là hết bị nhân. Con số còn thiếu lúc này — throughput
+routed có quay về ~932 hay không — đo được ngay sau đó: **có**. Qua workaround bridge thì một chiều
+890 Mbit/s (cổng WAN 1G là cổ chai), và với patch DSA thì 933 so với 932 của `main`. Lưu ý phải làm
+bằng uci chứ không phải `ip link` thủ công, vì firewall/NAT của netifd gắn theo device của
+interface.
+
+Vậy ở trạng thái rỗi không có gì rỉ sang port 5. Khác biệt duy nhất của cảnh routed là **VLAN**:
+
+| frame của cổng | VLAN khi qua conduit | member là ai |
+|---|---|---|
+| trong bridge VLAN-aware (`lan1..3`) | VID của bridge (6, 7, 68) | cổng đó + **đúng một** CPU port |
+| standalone, hoặc bridge VLAN-unaware (`wan`) | VID tag_8021q (3076) | cổng đó + **mọi** CPU port |
+
+Dòng thứ hai là chỗ hỏng, và nó nằm trong **DSA**, không nằm trong `qca8k`:
+
+```c
+/* net/dsa/tag_8021q.c:211 */
+static bool dsa_port_tag_8021q_vlan_match(struct dsa_port *dp,
+			      struct dsa_notifier_tag_8021q_vlan_info *info)
+{
+	return dsa_port_is_dsa(dp) || dsa_port_is_cpu(dp) || dp == info->dp;
+}
+```
+
+`dsa_port_is_cpu(dp)`: **mọi** CPU port là member của **mọi** VLAN tag_8021q. VLAN của bridge đi
+đường khác — `dsa_port_host_vlan_match()`, `net/dsa/switch.c:662`, có comment ngay trên đầu:
+*"Host VLANs match on the targeted port's CPU port"* — đúng một CPU port, là `dp->cpu_dp`.
+
+`/sys/kernel/debug/qca-dsa-nss/status` trên máy đang chạy xác nhận hai tập VID đó tồn tại thật:
+
+```
+lan1   if_num=32 vid=68   phys_if=1
+wan    if_num=37 vid=3076 phys_if=1
+```
+
+Ghép thành chuỗi nhân quả:
+
+1. `wan` là cổng standalone ⇒ frame của nó qua conduit trong VID 3076.
+2. VID 3076 có **cả hai** CPU port là member (`dsa_port_tag_8021q_vlan_match`).
+3. `wan` standalone ⇒ DSA không bật learning trên port 4 (**đo được**: LEARN=0) ⇒ MAC của máy đầu
+   xa không bao giờ vào ATU ⇒ mọi frame router đẩy ra `wan` là **unknown unicast**.
+4. ⇒ frame bị flood theo `GLOBAL_FW_CTRL1` = `0x3f`, trong một VLAN mà port 5 là member ⇒ **eth0
+   nhận một bản sao của từng frame**. Đó là flood mà `a67d696c5d` mô tả, chỉ là lý do port 5 lọt
+   vào tập đích là VLAN tag_8021q chứ không phải member mask.
+5. Traffic terminated của phép đối chứng cũ đi qua `br-lan`, VID 68, mà VID 68 chỉ có CPU port 0
+   là member ⇒ eth0 nhận 0. **Phép đối chứng cũ ra 0 vì sai VLAN, không phải vì LOOKUP_MEMBER
+   lọc.** Nó khác cảnh routed ở hai biến cùng lúc, nên không chứng minh được gì.
+
+Con số khớp cả về lượng: eth0 RX 1.675.825 ≈ eth1 RX 1.676.403 ≈ eth1 TX, tức eth0 nhận bản sao
+của **cả hai chiều** qua `wan`, không chỉ chiều đi. Chiều về (máy đầu xa → MAC của `wan`) lẽ ra là
+known unicast vì host FDB của `wan` được cài trên đúng một CPU port
+(`dsa_port_host_address_match`, `net/dsa/switch.c:132`) — **suy đoán** là entry đó mang `vid` 0
+nên lookup của frame mang VID 3076 không khớp (ATU chạy IVL) và cũng miss, cũng flood. Chưa đọc
+ATU/VTU để chốt.
+
+**Hệ quả rộng hơn board này:** đây là hành vi của DSA + tag_8021q, không riêng QCA8337. Switch nào
+có hai CPU port và dùng tagger 8021q thì traffic của cổng standalone đều bị nhân sang CPU port thứ
+hai khi CPU port ấy đang bật. Board nào **không tắt được** CPU port thứ hai thì đang trả giá này
+mà không ai nhìn (pz-l8, redmi-ax5400 — xem mục PR 26511).
+
+**Còn lại ở mức thanh ghi** (hành vi thì đã chứng minh bằng phép thử ba chân ở trên):
+
+- **Đọc VTU entry của VID 3076** để thấy port 5 trong egress set. VTU phải **ghi** thanh ghi mới
+  đọc được (ghi `VTU_FUNC1` ra lệnh đọc rồi đọc `VTU_FUNC0`), mà `registers` của regmap mở chế độ
+  0400. Mở bằng một patch hai dòng: `#define REGMAP_ALLOW_WRITE_DEBUGFS` trong
+  `drivers/base/regmap/regmap-debugfs.c` (`regmap-debugfs.c:605` kiểm đúng macro đó) → `registers`
+  thành 0600, đọc/ghi mọi thanh ghi switch từ userspace. Mạnh hơn patch `pr_info` nhiều: sau đó
+  thử được cả cách chặn — xoá port 5 khỏi `UC_DP_MASK` lúc đang chạy rồi đo lại.
+- **Bắt gói trên eth0** trong lúc có luồng routed (`tcpdump -i eth0 -e -n -c 20`) để đọc VLAN tag
+  trên chính frame bị nhân. Máy test chưa có `tcpdump`.
+
+Phép thử hành vi tương đương — cho `wan` vào bridge VLAN-aware — **đã làm, xem chân C ở trên**.
+Còn thiếu đúng một con số: throughput routed trong trạng thái đó.
+
+**Ép hai conduit cần reboot: ghi `fw_mask` lúc đang chạy không arm được GMAC mới.** Đã kiểm trong
+`qca_dwmac_nss.c` và xác nhận bằng đo. Thang trạng thái của glue là
+`IDLE → ARMED → OVERRIDDEN → STARTED`:
+
+- `dwmac_nss_fw_arm()` (≈`:890`, chỗ `fw_mask` ghi vào) chỉ đặt `port->state = DWMAC_NSS_PORT_ARMED`;
+- `OVERRIDDEN` do **qca-nss-drv** đặt khi nó gọi `nss_dp_override_data_plane()` (`:670`) trong vòng
+  khởi tạo của **chính nó** — không có cửa nào gọi lại sau đó;
+- `dwmac_nss_port_start_on_link()` (`:557`) là đường duy nhất tới `STARTED`, và **cả ba** chỗ gọi
+  (`nss_dp_start_data_plane()`, `NETDEV_UP`, `NETDEV_CHANGE`) đều gate `state == OVERRIDDEN`.
+
+Nên arm sau khi hệ đã chạy thì cổng đứng ở `armed / fw_link=down / link_changes=0` vĩnh viễn.
+`stop_service()` trong `nss-dwmac.init` nói thẳng điều đối xứng: *"The NSS plane cannot be detached
+at runtime; reboot to return to the host stack."* Hệ quả cho bản ghi cũ: **hai dòng `fw_mask=0x3`
+của đợt 1 (85-87 và 106 Mbit/s) đo một eth0 nửa vời, không phải hai conduit** — và đó là lời giải
+thích cho cả cụm "số liệu mồ côi" mà bản ghi trước để ngỏ. Muốn hai conduit thật thì
+`uci set nss.general.fw_mask='0x3'` + `uci commit` + **reboot**.
+
+**Đổi conduit thì ngược lại: có hiệu lực ngay lúc chạy.** `uci set network.@device[N].conduit` +
+`uci commit` + `/etc/init.d/network reload` dời `upper_wan` giữa eth0 và eth1 được, cả hai chiều,
+và `qca-dsa-nss` bỏ node VLAN cũ rồi cấp node mới trên `phys_if` đúng (nó `pr_info` từng node:
+`wan: vlan node if_num 33 vid 3076 on phys_if 0`). Không cần reboot, không cần dựng lại interface.
+Giả thuyết cũ "lệnh đổi conduit chưa thật sự áp" là **sai**; thủ phạm thật của cụm số liệu mồ côi
+là `fw_mask` ghi lúc chạy, như trên.
+
+**Hai conduit thật, và nó không chạy (dòng 4 và 5).** Sau reboot với `fw_mask=0x3` trong uci, cả
+hai GMAC lên `started` từ đầu (`phys_if 0: started dev=eth0 fw_link=up`) và `qca-dsa-nss` cấp node
+VLAN đầy đủ cho cổng ở cả hai conduit. Vậy mà thông lượng là **~100 Mbit/s**, và — quan trọng —
+**bằng nhau dù cổng có tách qua hai conduit (dòng 4) hay dồn cả bốn về eth1 (dòng 5)**. Tức cái
+làm hỏng là `fw_mask=0x3` / port 5 bật, **không** phải việc tách conduit.
+
+ECM cho thấy nó có thử mà không cài được rule nào:
+
+```
+accel_cmd_avg_millis   samples=37    ← đã thử 37 lần
+tcp_accelerated_count  0
+udp_accelerated_count  0
+src_mismatch_fail_count   18
+src_mismatch_flush_count  61
+```
+
+`tx_busy` trên `phys_if 0` lên tới 403.449 — hệ quả của 96% softirq host-path, không phải nguyên
+nhân. Vì sao ECM không accelerate được khi hai GMAC cùng `started`: **chưa biết**.
+
+**Kết luận cho `a67d696c5d`: đúng, cả thay đổi lẫn cơ chế.** Giá đo được của việc bật port 5, với
+mọi thứ khác y nguyên, là **209 Mbit/s (932 → 723) cộng trọn một core**. Cơ chế là đúng cái commit
+message nói: switch nhân frame routed sang GMAC0 và dìm eth0 trong softirq. Không có cấu hình nào
+trong đợt 2 lấy lại được 932 trong khi port 5 còn bật.
+
+**Kết luận cho mục tiêu "hai conduit để có ~1860":** không đạt trên board này, vì **hai** lý do
+độc lập — (a) `fw_mask=0x3` không accelerate được, (b) điều kiện tiên quyết là bật port 5, mà việc
+đó tự nó đã mất 23% và một core. Ngay cả khi (a) được sửa thì điểm khởi đầu đã là 723 chứ không
+phải 932.
+
+**Trần của một conduit: ~930 Mbit/s routed, bất kể hướng.** Đo trên `main` (port 5 tắt, bốn cổng
+trên eth1) — đây là dòng 1 của bảng, mở rộng:
+
+| lượt | iperf3 (app) | conduit eth1 RX | conduit eth1 TX | pps mỗi chiều |
+|---|---|---|---|---|
+| uplink | **932** Mbit/s | **958** | **958** | 85.707 / 85.692 |
+| downlink | **920** | **953** | **952** | 94.363 / 94.362 |
+| hai chiều (`--bidir`) | 859 + 71 = **930** | **957** | **957** | 87.289 / 87.251 |
+
+Cả ba lượt, eth1 bị ghim ở **~955 Mbit/s ở cả hai chiều cùng lúc** — line rate của link 1G full
+duplex, hết chỗ. Và frame RX ≡ frame TX: 1.780.311 so với 1.779.535 ở lượt hai chiều, lệch
+**0,04%**. Mỗi frame routed qua conduit **đúng hai lần** (một RX, một TX), đo được, không suy luận.
+Nên một chiều được 932, mà hai chiều cũng chỉ 930 **tổng**.
+
+Hai điều phải ghi kèm:
+
+- Lượt hai chiều chia **859 / 71**, lệch khủng khiếp: `--bidir` với 4 luồng mỗi chiều bỏ đói chiều
+  ngược. Cái bị chặn là **tổng**, không phải 470/470. Muốn chia đều hơn thì chạy hai instance
+  iperf3 độc lập.
+- Nhiều host cùng upload vẫn cộng vào **cả** RX và TX, nên tổng vẫn ≤930 dù một hay mười máy.
+  Lợi ích duy nhất mà hai conduit *có thể* mua là routing full-rate đồng thời cả hai chiều — và
+  theo đợt 2 thì board này không mua được.
+
+**Công cụ đo: MMC counter của stmmac.** `ethtool -S eth1` đọc counter **phần cứng MAC**, độc lập
+với DMA ring mà firmware chiếm, nên **vẫn chạy** khi `/sys/class/net/eth1/statistics/*` đóng băng.
+Đây là thứ duy nhất tìm được đo được tải conduit trong lúc NSS nắm GMAC — và như phần "1,25 triệu
+frame" ở trên, nó còn thấy được cả frame mà netdev không bao giờ thấy. Hai cái bẫy:
+`mmc_*_octetcount_gb` là **32-bit**, wrap ở 4,29 GB và cho delta **âm** (phải cộng lại 2³², hoặc
+dùng `framecount`); và thứ tự field trong `ethtool -S` là thứ tự **file**, không phải thứ tự regex
+đưa vào, nên phải parse theo tên.
+
+Ba đồng hồ khác, và chúng đo cái gì:
+
+| đồng hồ | đo gì | dùng được không |
+|---|---|---|
+| `ethtool -S ethN` (MMC) | frame/byte ở **phần cứng MAC**, sống dưới NSS | **có** — thước đo tải conduit duy nhất |
+| `/sys/class/net/ethN/statistics/*` | netdev, **đóng băng** khi firmware giữ ring | không, cho conduit; DSA user port (`wan`, `lan2`) thì vẫn chạy |
+| `qca-dwmac-nss/status` `rx_fw`/`tx_redirect` | **chỉ** gói đi lên Linux | không đo tải; nhưng là máy báo "offload vỡ" rất tốt (nhảy +256k khi vỡ, +114 khi lành) |
+| `ecm_nss_ipv4/accelerated_count` | **gauge** số connection đang accelerate (=5 với iperf3 4 luồng) | có, nhưng phải lấy mẫu **trong** lúc chạy |
+
+**Phụ: patch 714 đã tự đứng một mình.** Bản hai-conduit là lần đầu patch 714 phải làm việc mà
+**không** còn hook `05_cr8806_eth0_up` trong tree (thượng nguồn đã xoá). eth0 vẫn lên **1000Mb/s
+Full**, timing trong dmesg khớp mục 16: GE PHY attach `2.125s` → PHY4 `2.223s` → `eth0: Link is Up
+- 1Gbps/Full` ở `4.636s`. Nhưng xem "Việc đã làm" ở dưới: patch đó đã bị gỡ khỏi `main`.
+
+### Vì sao mấy tuần không thấy
+
+Cấu hình `wan` → `eth0` đã chạy trên máy này nhiều tuần, qua nhiều lần build và soak, mà không
+lần nào lộ ra. Bốn lý do xếp lên nhau:
+
+1. **Chưa bao giờ đo routed.** Mọi phép đo trước đó là một trong hai loại: (a) traffic bridged
+   Wi-Fi ↔ LAN, switch tự chuyển trong hardware, không lên CPU port nào; (b) iperf3 **kết thúc
+   trên router**. Loại (b) có cả lần cắm laptop vào jack WAN ở mục 16 — 378 Mbit/s 1 luồng,
+   466 Mbit/s 4 luồng, 233 chiều ngược. Số đó **đã là** triệu chứng, nhưng không phân biệt được
+   với bình thường: traffic kết thúc trên router vốn **không** được offload, nên bị CPU giới hạn
+   là điều phải xảy ra, và lúc đó đã giải thích đúng theo nghĩa đó. Thiếu là đường **đi xuyên** —
+   mà đường đó trước 2026-11-07 **không tồn tại**: mạng của cổng WAN chưa có masquerade cũng chưa
+   có forwarding sang lan. Không có đường routed thì không có đường cơ sở 932 để thấy 723 là bệnh.
+2. **Counter của conduit dưới NSS vô dụng.** Với `fw_mask=0x3`, NSS giữ DMA ring nên
+   `/sys/class/net/eth0/statistics/rx_bytes` **đóng băng ở 0** (`eth1 rx` cũng đứng ở 46.751 B
+   suốt mọi phép đo). Mọi lần kiểm "eth0 có chở gì không" đều đọc ra 0 — không phải vì nó rỗi mà
+   vì cái đồng hồ không chạy. Chỉ khi eth0 rời NSS về host counter mới nói thật.
+3. **Vai AP thì cấu hình xấu cũng không đau.** Máy là leaf AP bridge, jack WAN để trống, nên
+   **không có luồng routed nào** để `wan` → eth0 làm hỏng. Cái bẫy nằm đó im lìm cho tới lúc có
+   người dựng một đường routed qua nó — đúng hôm 2026-11-07.
+
+4. **Cái hộp *có* config lỗi cũng chưa bao giờ bị kích hoạt.** Home2 chạy build cũ (`r38369+5`) với
+   `network.@device[4].conduit='eth0'` và `nss.general.fw_mask='0x3'` — đúng cấu hình sinh ra mọi
+   con số xấu ở bảng trên, chạy nhiều tuần trong nhà. Đọc `status` của nó 2026-11-08:
+   `phys_if 0: started dev=eth0  tx_redirect=0  rx_fw=0`, và `wan@eth0` **NO-CARRIER** — jack WAN
+   của nó **trống suốt**. Nên eth0 ở đó chưa từng chuyển một frame nào. Đây là lý do mạnh nhất:
+   không phải "chưa đo đúng", mà là **chưa từng có cáp trong jack WAN của bất kỳ máy nào** có cấu
+   hình đó, cho tới 2026-11-07.
+
+Điều **không** phải nguyên nhân: "tại chỉ test qua Wi-Fi". Biến thiếu là **routed so với kết thúc
+trên router**, không phải dây so với Wi-Fi.
+
+### Chín suy luận đã sai, ghi lại để khỏi lặp
+
+Cụm này dài vì nó đáng dài: **năm** trong chín cái sai cùng một kiểu — lấy một mệnh đề đọc được
+(trong code, hoặc trong một phép đo hẹp) rồi phát biểu nó như một mệnh đề về hành vi chung.
+
+1. **"Tính dung lượng SGMII full-duplex là đủ để kết luận"** — đúng về con số, sai về lúc dùng:
+   tính đường truyền như thể data plane là phần mềm thuần, trong khi thứ quyết định ở cấu hình xấu
+   là offload. Phần tính chỉ đứng vững **sau khi** đã biết đâu là thủ phạm.
+2. **"`dropped frame` = 0 nên không có vấn đề gì ở eth0"** — sai vì chọn sai chỗ nhìn, và vì
+   `fw_mask=0x3` làm mọi counter netdev của eth0 đóng băng (lý do 2 ở phần "Vì sao mấy tuần không
+   thấy"). Phiên bản mạnh hơn của cùng cái bẫy: ở phép đo flood, `rx_dropped=0`, `rx_errors=0`,
+   `mmc_rx_fifo_overflow=0` **trong khi 1,25 triệu frame đang mất**. Counter bằng 0 không chứng
+   minh được gì cả.
+3. **"RX và TX của SGMII độc lập nên conduit thứ hai không mua được gì"** — sai: một frame routed
+   tiêu **một đơn vị RX và một đơn vị TX**, nên hai chiều chia nhau cùng một ngân sách. Đo ra: một
+   chiều 932, hai chiều 930 **tổng**, frame RX ≡ frame TX lệch 0,04%.
+4. **"`GLOBAL_FW_CTRL1` lấy mọi CPU port nên bản sao rơi vào CPU port rỗi"** — **đây là câu đúng**,
+   và tôi đã gạch nó đi để thay bằng "LOOKUP_MEMBER lọc hết" (xem số 7). Phép đo 2026-11-08 trả
+   nó về chỗ.
+5. **"`fw_mask=0x3` làm sập thông lượng ngang nhau dù cổng có tách conduit hay không, nên phải
+   còn một nguyên nhân thứ hai độc lập"** — sai, và sai vì cùng một chỗ: lúc đó **flood vẫn
+   đang chạy**, nên cả hai cấu hình đều đo cái flood chứ không đo hai conduit. Chặn flood rồi thì
+   `fw_mask=0x3` + tách conduit chạy sạch (933 một chiều, 1104–1458 hai chiều, ECM 9 flow,
+   `src_mismatch_fail_count` 0). Không có nguyên nhân thứ hai. Hai dòng 4 và 5 của bảng A/B
+   (~100 Mbit/s, ECM không cài được rule nào) là flood cộng một eth0 nửa-arm, không phải một bug
+   riêng.
+6. **"`rx_fw`/`tx_redirect` đo được tải conduit"** — sai. Tôi đọc hai chỗ tăng counter
+   (`qca_dwmac_nss.c:177` trong `dwmac_nss_fw_xmit()` và `:779` trong `nss_dp_receive()`) rồi kết
+   luận chúng đếm traffic của conduit. Chúng chỉ đếm **traffic đi lên Linux**: flow được NSS
+   accelerate không bao giờ tới hai dòng đó. Đo ra 1.538.421 frame qua conduit trong 20 s trong
+   khi `tx_redirect` nhúc nhích **+114**. Biết một counter tăng ở dòng nào **không** cho biết
+   traffic nào chạy tới dòng đó — phải kiểm thước đo bằng một tải đã biết trước khi tin nó.
+7. **"Một CPU port thứ hai đang up mà không mang user port nào thì không nhận gì cả"** — **sai về
+   phạm vi**, và đây là cái sai nặng nhất của cả mục vì nó làm tôi viết lại cả mục này một lần
+   theo hướng ngược, kèm một comment DTS và ba bản nháp gửi ra ngoài. Phép đo nền là thật (0 frame
+   trên eth0) nhưng nó dùng **traffic kết thúc trên router** và LAN rỗi — **chưa bao giờ là luồng
+   routed**. Dưới luồng routed, eth0 nhận bản sao lệch 0,03%. Cathgao đúng ở chỗ nói "routed",
+   và tôi đã gạch nó đi; biến thật — đọc ra từ thanh ghi ngày 2026-11-08 — là **frame đi qua
+   conduit trong VLAN nào**: VLAN tag_8021q của cổng standalone có mọi CPU port là member, VLAN
+   của bridge chỉ có một. "Routed" trong rig này trùng với "qua cổng `wan` standalone", nên nó là
+   dấu hiệu đúng dù không phải nguyên nhân. Bài học cụ thể: khi một commit message nói "routed",
+   **đừng** đối chứng bằng traffic terminated — phép đối chứng đó lệch hai biến cùng lúc.
+8. **"`accel=0` nghĩa là flow không được offload"** — sai, lỗi lấy mẫu:
+   `/sys/kernel/debug/ecm/ecm_nss_ipv4/accelerated_count` là **gauge** số connection *đang* được
+   accelerate (bằng 5 khi chạy iperf3 4 luồng), không phải tổng tích luỹ. Tôi lấy mẫu trước và sau
+   lượt chạy nên cả hai đều ra 0. Phải lấy mẫu **trong** lúc chạy.
+
+9. **"Hai conduit không mua được gì trên board này"** — kết luận của tối 2026-11-07, viết thẳng
+   vào commit message của nhánh test (`TEST: ... two DSA conduits`), và sai trong vòng mười hai
+   giờ. Nó dựa trên hai phép đo mà **cả hai** đều bị flood: port 5 bật = 723 Mbit/s, và
+   `fw_mask=0x3` = ~100 Mbit/s. Đo cái gì đang hỏng rồi kết luận về cái lẽ ra nó phải làm là cùng
+   một kiểu sai với số 7 — phạm vi. Bài học: khi một cấu hình mới đo ra **tệ hơn** cấu hình cũ
+   nhiều lần, giả thuyết đầu tiên là "nó đang hỏng", không phải "nó không giúp được gì".
+
+**Sáu cái bẫy khi đo, ghi để khỏi mắc lại.**
+
+1. Đọc `/sys/class/net/wan/speed` **trong** mỗi phép đo. Một lần cáp marginal bắt tay 100M làm cả
+   một phép đo thành vô nghĩa, và 94,x Mbit/s trùng đúng line-rate 100BASE-TX nên rất dễ tin lầm.
+2. **Ghi lại conduit của từng cổng trong từng phép đo** (`ls /sys/class/net/eth*/upper_*`), và
+   **trạng thái `phys_if` của từng GMAC** (`/sys/kernel/debug/qca-dwmac-nss/status`: `idle` /
+   `armed` / `started`). Cả đợt đo 1 thành vô giá trị vì thiếu đúng hai dòng log này: không có bản
+   ghi conduit, và không ai thấy rằng `fw_mask=0x3` ghi lúc chạy chỉ đưa eth0 tới `armed`.
+3. Counter byte của conduit (`/sys/class/net/ethN/statistics/*`) **đóng băng khi NSS giữ ring**.
+   Counter MIB của user port (`lan2`) cũng đứng khi NSS giữ eth1 — dùng `br-lan` thay. Nhưng cách
+   đúng để đo **tải conduit** là `ethtool -S ethN`, counter MMC trong phần cứng MAC: nó vẫn chạy
+   dưới NSS. Xem "Công cụ đo" ở trên, kèm hai cái bẫy wrap 32-bit và thứ tự field.
+4. **Không** tính softirq bằng vòng lặp `sleep 2` có `dmesg | grep -c` bên trong: dưới tải 90%
+   softirq mỗi vòng mất ~6,7 s thay vì 2 s, cửa sổ sai, phần trăm vô nghĩa. Cách đúng: chụp
+   `/proc/stat` trước/sau, lấy `softirq delta / tổng delta` (USER_HZ = 100).
+5. `pgrep -c` **đếm cả tiến trình đang STOP**, nên nó không nói được "build đã dừng chưa"; phải
+   xem cột STAT của `ps`. Và `start-stop-daemon -S -b` đẩy stdout vào `/dev/null`, redirect bên
+   ngoài vô dụng — phải `exec > file 2>&1` ngay trong script được gọi.
+6. **`iperf3 --bidir` không cho một mức, nó cho một cái tán.** Cùng một cấu hình, chiều về ra từ
+   164 tới 542 Mbit/s giữa các lượt. Nên đo **từng chiều riêng** (ở đây cả hai đều 945/946 Mbit/s =
+   tốc độ dây) và chỉ dùng tổng bidir để so A/B cùng rig, đừng trích nó như một con số tuyệt đối.
+   Muốn một số tổng thật thì cần nguồn traffic thứ hai: một cổng 2,5G, hoặc hai máy mỗi phía.
+
+**Hai cái bẫy khi đo trên máy đang phục vụ nhà (học đêm 2026-11-07).**
+
+- `fw_mask=0x0` (nhả **cả hai** GMAC cho host) **cắt đường forward của máy**: `br-lan` vẫn nhận
+  traffic mà `eth1`/`lan2` đứng im. Mất mạng toàn bộ, phải rút điện. Đừng ghi `0x0`; muốn thấy
+  counter của eth0 thì `0x2` là đủ và đã chạy ổn nhiều lần.
+- Đổi flag boot sang slot test rồi để đó = đem bản test đặt vào đường đi của cả nhà. Nếu phải
+  làm thì **đổi flag về slot tốt ngay sau khi boot**, để mọi lần reboot sau tự về bản tốt; và
+  đổi SSID của máy test cho khác nhà (config là **riêng từng slot**, nên đổi ở slot nào chỉ có
+  tác dụng ở slot đó).
+
+**Việc đã làm sau phép đo này.**
+
+- Gỡ patch 714 khỏi `main` (`kernel: drop the DSA PHY-to-PHY conduit patch`). Lý do: với port 5
+  tắt, trong cây này **không còn CPU port nào** patch áp vào — nó không sửa gì. Grep cả hai cây
+  cho thấy có board khác cùng topology (mainline: `imx6q-b450v3/b650v3/b850v3`; OpenWrt
+  qualcommax: `ipq8074-rt-ax89x` port@0, `ipq5018-spnmx56`/`cudy-p5`/`redmi-ax5400`/`pz-l8`
+  port@5, `ipq5018-ax6000` port@4), **nhưng** các board đó đều có user port cấu hình trên conduit
+  ấy nên netifd tự mở — chúng chưa bao giờ cần patch. Nhánh `patch714-netdev-draft-20261106` và
+  `dsa-conduit-open` giữ nguyên trong fork, cần thì lấy lại.
+- Bỏ hai override thừa trong config Home1: `network.@device[3].conduit='eth0'` và
+  `nss.general.fw_mask='0x3'`. Với port 5 đã tắt thì cả hai đều vô nghĩa — kernel không có eth0
+  làm conduit nữa, và giá trị dẫn xuất đúng là `0x2`. Xác nhận 2026-11-08: sau reboot vào `main`,
+  `fw_mask` tự ra **`0x2`**, đúng như `nss_dsa_fw_mask()` dự kiến.
+- Nhánh `no714-hook` (= `port5-ab` + Revert 714 + khôi phục hook) đã build EXIT=0, image ở chỗ
+  lưu riêng. **Chưa flash**, và câu hỏi nó sinh ra để trả lời (cách mở eth0 có quan trọng không)
+  vẫn chưa có câu trả lời bằng đo.
+- Nhánh `port5-2conduit` (`main` + bật port 5 + patch 714 + `ip-bridge`) đã build và **đã nạp
+  slot 1**, chạy đợt đo 2. Sau khi đo xong đã dọn uci của slot 1 (xoá `fw_mask`, xoá `conduit`)
+  và trả `flag_last_success` / `flag_boot_rootfs` về **0**, nên mọi lần reboot sau tự về slot 0 =
+  `main`. Slot 1 sau đó được nạp bản **có patch DSA** và thành **slot chính**: `flag_last_success`
+  = `flag_boot_rootfs` = `flag_boot_success` = **1**, `flag_ota_reboot` và cả hai
+  `flag_try_sysN_failed` = 0, nên mất điện hay reboot đều về đúng nó. Đường về `main` (slot 0, còn
+  nguyên): `fw_setenv flag_last_success 0; fw_setenv flag_boot_rootfs 0; reboot`.
+- `ip-bridge` (cho `bridge vlan show`) không có trong `ip-full`; nó là package riêng,
+  `package/network/utils/iproute2/Makefile:89`. Đã thêm vào bản test. Lưu ý nó **không** thấy VID
+  của firmware (3076) vì tagger của `qca-dsa-nss` ghi thẳng vào VTU, không qua `bridge`.
+
+### Hai câu từng để mở, và câu trả lời
+
+Mục tiêu "hai conduit cho ~1860" đóng ở mức **không đạt như hình dung ban đầu** — không phải vì
+conduit, mà vì cổng WAN 1 Gbit là cổ chai (xem "Hai conduit, không bridge" ở dưới). Hai câu cơ chế
+còn lại đều trả lời được trong ngày 2026-11-08, và hoá ra là **một** câu:
+
+| # | câu hỏi | câu trả lời |
+|---|---|---|
+| 1 | Vì sao frame routed bị nhân sang CPU port thứ hai? | DSA cho **mọi** CPU port làm member của **mọi** VLAN tag_8021q (`dsa_port_tag_8021q_vlan_match`), trong khi VLAN của bridge chỉ cấp cho CPU port của chính cổng đó (`dsa_port_host_vlan_match`). Cổng standalone đi trong VID 3076 mà cả hai CPU port đều thuộc, learning tắt nên MAC đầu xa không bao giờ vào ATU → mọi frame routed là unknown-unicast flood. Chứng minh bằng phép thử ba chân, rồi bằng patch. |
+| 2 | Vì sao ECM không cài được rule nào khi **cả hai** GMAC `started` (`samples=37`, `tcp_accelerated_count=0`, `src_mismatch_fail_count=18`)? | **Hệ quả của câu 1**: ECM thấy cùng một gói vào hai `phys_if` thì flush. Chặn flood là hết — 9 flow accelerate, `src_mismatch_fail_count` = 0. Hai bệnh hoá ra là một. |
+
+Câu hỏi cũ số 3 — hook `05_cr8806_eth0_up` so với patch 714 có khác gì đo được không — **bỏ**:
+thượng nguồn đã xoá hook, và patch 714 tự đứng một mình được (xem "Phụ: patch 714 đã tự đứng một
+mình" ở trên). Nhánh `no714-hook` (`ebdb8df625`) chỉ còn giá trị cho PR 26511.
+
+Còn đúng một việc chưa làm, và nó chỉ là xác nhận cuối ở mức thanh ghi: đọc VTU entry của VID 3076
+để thấy port 5 trong egress set — xem "Việc còn lại".
+
+### Phá trần lần đầu: hai conduit chạy thật, qua workaround bridge (2026-11-08, sáng)
+
+**Mục tiêu "hai conduit" ĐẠT** — lần đầu, và bằng một workaround mà patch ở phần sau làm cho
+không còn cần. Cấu hình: port 5 bật trong DTS, `fw_mask=0x3`, cổng `wan` dùng
+conduit `eth0`, ba cổng LAN dùng `eth1`, **và cổng `wan` nằm trong một bridge VLAN-aware** để frame
+của nó rời khỏi VLAN tag_8021q. Reboot để `fw_mask` có hiệu lực.
+
+| | 1 conduit (`main`, port 5 tắt) | 1 conduit, port 5 bật (flood) | **2 conduit, flood tắt** |
+|---|---|---|---|
+| một chiều | 932 | 723 | 890 *(cổng WAN 1G là cổ chai)* |
+| **hai chiều, tổng** | **930** | — | **>1100** *(lượt này ra 1552 = 890 + 662, nhưng `iperf3 --bidir` tán rất rộng; số vững là 1104–1458 ở "Hai conduit, không bridge")* |
+| softirq cpu0 / cpu1 | 0,3% / 1,8% | **91,0%** / 3,6% | **1,7% / 1,6%** |
+| ECM accelerated | ok | 5 | **9** |
+
+Đếm frame trong window 20 s của lượt hai chiều cho thấy đúng hình dạng phải có:
+
+| conduit | RX | TX | tổng |
+|---|---|---|---|
+| `eth0` (của `wan`) | +1.861.194 | +1.318.910 | 3.180.104 |
+| `eth1` (của LAN) | +1.318.980 | +1.860.978 | 3.179.958 |
+
+`eth0 RX ≡ eth1 TX` và `eth1 RX ≡ eth0 TX`, khớp tới **0,01%**. Tức mỗi frame routed qua **đúng
+một** conduit cho mỗi chiều, thay vì qua cùng một conduit hai lần — đó chính xác là điều mà mục
+tiêu "hai conduit" cần, và là lý do trần đôi lên. Và **không còn bản sao nào**: ở cấu hình cũ
+`eth0 RX ≈ eth1 RX` (nhân đôi), giờ `eth0 RX` là data còn `eth1 RX` chỉ là ACK.
+
+Thanh ghi đọc giữa lúc tải chạy, cả ba lần:
+
+```
+0624: 3f3f3f3f   0660: 0004030e   0690: 00140320   069c: 00040310
+```
+
+`GLOBAL_FW_CTRL1` **không cần đổi** — vẫn `3f3f3f3f`, port 5 vẫn là đích flood. Cái đổi là member
+mask theo conduit (`0660`: port 0 ↔ {1,2,3}; `0690`: wan ↔ {5}; `069c`: port 5 ↔ {4}) và **VLAN**:
+`qca-dsa-nss` báo `wan if_num=33 vid=1 phys_if=0`, tức VID của bridge trên conduit `eth0`, không
+còn VID 3076 nữa.
+
+**Câu 2 ở trên cũng rơi theo:** ECM accelerate 9 flow bình thường với `fw_mask=0x3`. Lần
+trước nó ra `tcp_accelerated_count=0` và `src_mismatch_fail_count=18` **vì flood** — cùng một gói
+vào NSS qua hai phys_if. Tắt flood là hết `src_mismatch`. Hai bệnh hoá ra là một.
+
+**Cách làm, bằng uci** (netifd và firewall đi theo device của interface, nên không làm bằng
+`ip link` thủ công được):
+
+```
+# 1. bridge VLAN-aware chứa cổng standalone
+uci add network device; uci set network.@device[-1].name='brwan'
+uci set network.@device[-1].type='bridge'; uci add_list network.@device[-1].ports='wan'
+uci add network bridge-vlan; uci set network.@bridge-vlan[-1].device='brwan'
+uci set network.@bridge-vlan[-1].vlan='1'; uci add_list network.@bridge-vlan[-1].ports='wan:u*'
+# 2. địa chỉ phải nằm trên device 8021q ở trên bridge, KHÔNG phải trên bridge
+uci add network device; uci set network.@device[-1].name='brwan.1'
+uci set network.@device[-1].type='8021q'; uci set network.@device[-1].ifname='brwan'
+uci set network.@device[-1].vid='1'
+uci set network.<Interface>.device='brwan.1'
+# 3. chia tải + arm GMAC thứ hai
+uci set network.@device[<n>].conduit='eth0'     # section device của cổng wan
+uci set nss.general.fw_mask='0x3'               # override, nss-dwmac-up:68
+uci commit network; uci commit nss              # rồi reboot
+```
+
+Cái bẫy mất nửa giờ: đặt IP thẳng trên `brwan` thì **không ra gói nào** —
+`bridge vlan show dev brwan` cho `1` mà **không** `PVID Egress Untagged`, nên traffic do router phát
+ra không có PVID và bị rớt ngay trong bridge (`wan` netdev `tx_packets` = 0). Phải đặt IP trên một
+device `8021q` ở trên bridge, đúng như `br-lan.68` của máy này vẫn làm.
+
+**Nhưng workaround không phải chỗ nên dừng.** Gốc nằm trong DSA:
+`dsa_port_tag_8021q_vlan_match()` (`net/dsa/tag_8021q.c:211`) cho mọi CPU port làm member của mọi
+VLAN tag_8021q, trong khi `dsa_port_host_vlan_match()` (`net/dsa/switch.c:662`) chỉ cấp VLAN của
+bridge cho `dp->cpu_dp`. Sửa đúng là cho tag_8021q theo cùng quy tắc — xem "Việc còn lại".
+
+### Patch DSA: viết, build, nạp, đo (2026-11-08, chiều)
+
+Workaround không còn cần. Patch `net: dsa: tag_8021q: give a port's VLAN only to its own CPU
+port` làm hai việc, và phải làm cả hai:
+
+1. `dsa_port_tag_8021q_vlan_match()` — CPU port chỉ match khi nó **là** `info->dp->cpu_dp`, đúng
+   quy tắc `dsa_port_host_vlan_match()` đã dùng cho VLAN của bridge.
+2. Hai helper `dsa_tag_8021q_port_{pre,post}_change_conduit()` gọi quanh
+   `dsa_port_assign_conduit()` trong `dsa_port_change_conduit()`, cộng nhánh rewind. Thiếu phần
+   này thì đổi `conduit` lúc đang chạy sẽ để VLAN lại ở CPU port cũ và cổng mất đường lên — gần
+   như chắc chắn đây là lý do DSA cấp VLAN cho **mọi** CPU port ngay từ đầu.
+
+**Chỗ đặt patch.** Lúc đo nó nằm ở `qualcommax/patches-6.18/0959g-...` (nhánh
+`dsa-tag8021q-own-cpu-port`), cho chắc là apply sau `0959a-...-unwind-failed-programming.patch`
+vốn sửa cùng vùng. Bản gửi đi và bản trên `main` nằm ở
+`generic/pending-6.18/784-net-dsa-tag_8021q-give-a-port-s-VLAN-only-to-its-own-CPU-port.patch`, vì
+hành vi nằm trong `net/dsa` và mọi target có hai CPU port + tagger 802.1Q đều bị — **mã y hệt bản
+đã đo** (diff phần mã: rỗng). Số 784 vì 780 đã có chủ (`780-ARM-kirkwood-...`); đã kiểm `0959a-`
+và `779-` vẫn apply `--fuzz=0` ở cả hai thứ tự và không chung file nào với nó.
+
+**Chân A lặp lại, cùng một biến duy nhất là patch.** `wan` standalone, `vid=3076`, port 5 bật, một
+conduit — tức đúng cảnh trước đây cho +825:
+
+| | trước patch | **sau patch** |
+|---|---|---|
+| eth1 TX | +917 | +1046 / +1032 / +1076 |
+| **eth0 RX** | **+825** | **+0 / +0 / +0** |
+
+`GLOBAL_FW_CTRL1` vẫn `3f3f3f3f`, `PORT_LOOKUP_CTRL(4)` vẫn `00040301` (LEARN vẫn tắt), VLAN vẫn
+3076. **Không một mask nào đổi** — chỉ VTU đổi, và bản sao mất hẳn. Đây là lý do thanh ghi
+`PORT_LOOKUP_*` không bao giờ cho thấy được cơ chế: port 4 chạy `VLAN_MODE=3` (secure), nên bảng
+quyết định là VTU chứ không phải member mask port-based.
+
+**Cái giá của CPU port thứ hai: hết.** Cùng cấu hình một conduit, port 5 bật, routed+NAT,
+`iperf3 -t 20 -P 4`:
+
+| | trước patch | **sau patch** | `main` (port 5 tắt) |
+|---|---|---|---|
+| throughput | 723 | **933** | 932 |
+| eth0 RX (bản sao) | +1.687.067 ≡ ingress | **0 suốt cả lượt** | 0 |
+| softirq cpu0 | 91,0% | **~2,0%** | 0,3% |
+
+Tức `a67d696c5d` tắt port 5 là đúng **với kernel chưa patch**. Có patch rồi thì bật port 5 không
+còn mất gì — và đó mới là chỗ nên sửa.
+
+### Hai conduit, không bridge: trần 929 bị phá, lặp được
+
+Chỉ cần `conduit='eth0'` cho device `wan` + `nss.general.fw_mask='0x3'`. **Không `brwan`, không
+`brwan.1`, không cái bẫy PVID** — `wan@eth0` đứng một mình với IP tĩnh, ARP tới ngay.
+
+A/B so le, ba lượt mỗi bên, cùng một kernel, chỉ đổi `conduit` của `wan` (`network reload`, không
+reboot — và chính việc này chạy được là phần 2 của patch tự chứng minh):
+
+| lượt | 1 conduit | 2 conduit |
+|---|---|---|
+| 1 | 927 | **1202** |
+| 2 | 928 | **1458** |
+| 3 | 929 | **1104** |
+
+Một conduit là một cái trần **cứng**: 927–929, ba lượt lệch 2 Mbit/s. Hai conduit luôn vượt, nhưng
+tán rộng 1104–1458 — và chỗ tán đó là **máy đo**, không phải router. Đọc thêm bằng MMC octet
+counter trong một lượt bidir (lưu ý `ethtool -S` in **tx trước rx**, xếp sai cột một lần rồi):
+
+| | eth0 (conduit của `wan`) | eth1 (conduit của LAN) |
+|---|---|---|
+| RX | **1050** Mbit/s (từ laptop) | 430 |
+| TX | 430 (ra laptop) | **1056** (ra máy phía LAN) |
+| tổng trên conduit | **1480** | 1486 |
+
+`eth0 RX ≡ eth1 TX` và `eth1 RX ≡ eth0 TX`: mỗi frame qua **đúng một** conduit mỗi chiều. Và
+`eth0 RX = 1050 Mbit/s` mức dây tức **cổng WAN 1 Gbit đã bão hoà** — conduit đang gánh 1,48 Gbit/s
+và còn xa giới hạn. Nút cổ chai đã dời từ conduit sang cổng vật lý.
+
+**Vì sao con số tổng không đáng tin, và 1552 lúc trước nên đọc thế nào.** Rig chỉ có **một** card
+1 GbE ở cổng WAN và **một** máy 1 GbE ở phía LAN, nên mỗi chiều tối đa ~1 Gbit; đo tổng thì buộc
+phải dùng `iperf3 --bidir`, mà bộ xếp lịch bidir của iperf3 trên con Realtek này cho RX-C từ 164
+tới 542 Mbit/s giữa các lượt **cùng cấu hình**. Đo riêng từng chiều thì cả hai đều **945/946
+Mbit/s** = tốc độ dây. Nên: con số **929 so với >1100** là kết luận vững (trần bị phá, lặp được
+sáu lượt); con số **1552** đo được một lượt ở phần trên là đỉnh của cái tán đó, không phải một
+mức ổn định — đừng
+trích nó như một con số đo được. Muốn số tổng thật thì cần nguồn traffic thứ hai (cổng 2,5G hoặc
+thêm một máy ở phía LAN).
+
+ECM cũng sạch theo: 9 flow được accelerate, `src_mismatch_fail_count` = **0** (trước patch là 18),
+softirq ~2,5% mỗi core.
+
+### Rebase
+
+`main` lên `f3588d3871`: **sạch, không xung đột**, 11 commit → **10** (commit bỏ hook bị drop).
+
+| | trước | sau |
+|---|---|---|
+| `main` | `7735441d3c` | `12493d4754` |
+| nền thượng nguồn | `d1b5d4f8ec` | `f3588d3871` |
+| backup | | tag `backup/main-pre-rebase-20261107b` = `7735441d3c` |
+
+Lưu ý `scripts/getver.sh`: nó lấy `main@{u}` (= `fork/main`) để tìm `UPSTREAM_BASE`, nên trước khi
+push fork/main, chuỗi revision ra `r38500+13-d1b5d4f8ec` (13 = 3 commit thượng nguồn + 10 của
+mình). Sau khi push nó mới gọn lại. Với bản test thì không quan trọng; nếu làm release thì push
+`fork/main` **trước** khi build.
+
+### Việc kuncy7 nhờ
+
+Trong comment merge, kuncy7 nhờ đúng một việc: máy ở đây là board CR880x duy nhất còn chạy
+**layout dual-boot gốc**, nên xin một lần kiểm LAN/WAN và NSS offload trên ảnh từ `f3588d3871`
+trở lên, "no need to hold anything for it".
+
+### Gửi đi, vào `main`, và release (2026-11-08)
+
+- **PR 68 cho kuncy7**: https://github.com/kuncy7/openwrt-nss-edma/pull/68 — 4 commit, 8 file,
+  +443/-38, nền `origin/c3po-tag-8021q` (`767c03c5ad`), nhánh `pr/two-conduits` của fork. Thứ tự cố
+  ý tách được: 714 (conduit-open) → 784 (tag_8021q) → nss-tools `fw_mask` → chính sách board CR880x;
+  bỏ commit cuối thì ba cái trước vẫn đứng một mình. Mọi commit có `Signed-off-by` (thêm **trước**
+  khi push, để lần gửi `openwrt/openwrt` không phải viết lại lịch sử). Kèm một comment xin người
+  test đúng ba việc: lặp lại flood, bỏ 714 ra xem conduit còn lên không, và một số tổng đo bằng hai
+  nguồn traffic. **Không tự ping ai** — để kuncy7 điều phối.
+- **`main` của fork**: cherry-pick đúng bốn commit đó lên `e42fc44bb8` → **`6156676c89`**. Kiểm
+  trước khi build: patch 784 trên `main` **giống từng dòng mã** bản `0959g` đã đo trên máy (diff
+  phần mã: rỗng), dtsi chỉ khác phần comment. Khác bản đang chạy đúng hai chỗ, và cả hai là tốt
+  hơn: `board.d` cho `wan` dùng `eth0`, và `nss-tools` tự dẫn ra `fw_mask=0x3` — tức ảnh release
+  không cần hai override tay mà slot 1 đang đặt.
+- **Release `cr8806-nss-2026.11.08`** (tag = `6156676c89`, `DISTRIB_REVISION` `r38515-6156676c89`):
+  build lại từ `make target/linux/clean`, EXIT=0; kiểm trong cây đã build rằng cả hai patch kernel
+  thật sự vào (`dsa_tag_8021q_port_pre_change_conduit` và `of_phy_is_fixed_link` trong
+  `net/dsa/port.c`) và rootfs mang `board.d` + `lib/nss/functions.sh` bản mới. Ảnh ở
+  `~/nss-build/images-release-20261108/`, `sha256sum -c` khớp cả 8 file. Config chỉ khác 2026.11.07
+  **đúng một dòng**: `CONFIG_PACKAGE_ip-bridge=y`.
+  **Chưa nạp ảnh này lên máy nào** — mọi số đo là của nhánh test cùng mã, và release notes nói rõ
+  chỗ đó.
+  Nhớ: `scripts/getver.sh` lấy `main@{u}`, nên **push `fork/main` trước khi build** — làm đúng thứ
+  tự nên revision ra gọn, không còn `+N` như lần 2026-11-07.
+- Front page `.github/README.md` sửa lại dòng "plus two commits" cho đúng những gì `main` mang bây
+  giờ (`1469a4a835`).
+- Ba comment còn lại — kuncy7 issue 53, `openwrt/openwrt` issue 26157, `openwrt/openwrt` PR 26511 —
+  đã viết gọn lại, **chưa gửi**.
+
 ## Việc còn lại
+
+- ~~**Kiểm ảnh từ `f3588d3871` trở lên cho kuncy7**~~ — **xong 2026-11-07/08**, xem mục 26.
+  LAN/WAN thông, routed đạt line rate một chiều (932 Mbit/s), NSS offload còn nguyên, softirq
+  0,3%/1,8%, 0 `dropped frame`: không có regression nào. Và bật lại port 5 là **đủ** để routed sập
+  932 → 723 Mbit/s với một core cháy 98% — `a67d696c5d` đúng cả thay đổi lẫn cơ chế.
+  **Còn lại**: comment kết quả cho kuncy7 (issue 53) đã viết, **chưa gửi**; và quyết định giữ hay
+  xoá các nhánh test `port5-ab` (`e7bd354a12`), `no714-hook` (`ebdb8df625`),
+  `port5-2conduit` (`205d5d7cc2`), `dsa-tag8021q-own-cpu-port` (`59638795e2`), `pr/dsa-tag8021q`.
+- ~~**Viết patch DSA cho `dsa_port_tag_8021q_vlan_match()`**~~ — **xong 2026-11-08**, nhánh
+  `dsa-tag8021q-own-cpu-port`, đã build, nạp slot 1 và đo: bản sao trên eth0 về **0**, một conduit
+  với port 5 bật đi từ 723 lên **933**, hai conduit phá trần 929 mà **không** cần `brwan`. Chi tiết
+  ở mục 26, "Patch DSA: viết, build, nạp, đo". **Đã gửi kuncy7**: PR 68 (4 commit, nền
+  `c3po-tag-8021q`), kèm một comment xin người test. **Còn lại**: gửi hai patch kernel lên
+  `openwrt/openwrt` `generic/pending-6.18`, rồi bản `[PATCH net-next]` lên netdev; và ba comment đã
+  viết gọn nhưng chưa gửi (kuncy7 issue 53, openwrt issue 26157, openwrt PR 26511).
+- **Xác nhận ở mức thanh ghi: đọc VTU entry của VID 3076** để thấy port 5 trong egress set. Cần
+  một patch hai dòng `#define REGMAP_ALLOW_WRITE_DEBUGFS` trong
+  `drivers/base/regmap/regmap-debugfs.c` để `/sys/kernel/debug/regmap/.../registers` thành 0600.
+  Hành vi thì đã chứng minh xong (phép thử ba chân, workaround bridge, rồi patch), đây chỉ là xác
+  nhận cuối.
+- ~~**Quyết định cho cây này: hai conduit có thành mặc định của CR880x không?**~~ — **có**, từ
+  2026-11-08: `main` = `6156676c89` mang đủ bốn commit (714, 784, nss-tools `fw_mask`, chính sách
+  board), nên `ethernet-port@5` bật lại, `board.d` cho `wan` dùng `eth0` và `fw_mask` tự dẫn ra
+  `0x3` — **không cần bridge, không cần override tay nào**. Rủi ro còn lại là lệch thượng nguồn:
+  nếu ai lấy `main` này mà bỏ hai patch kernel đi thì rơi về 723 Mbit/s với một core cháy, nên hai
+  patch đó phải đi cùng commit board policy (PR 68 xếp đúng thứ tự đó).
+- ~~**Nạp lại một bản tốt vào slot 1 của Home1**~~ — xong: slot 1 giữ bản có patch DSA và nay là
+  slot chính. **Còn lại**: slot 0 vẫn là `main` của 2026-11-07 (một conduit) làm đường về; khi nào
+  tin bản mới thì nạp release 2026.11.08 vào slot 0.
 
 - ~~PR 50: chạy ngắn cùng commit không profile để so `Frame OOR`, `Overflow`,
   `tx_desc_alloc_fail`~~ — **bỏ, không làm nữa** (quyết định 2026-11-06). Bản mục 12 đã soak
@@ -1850,9 +2713,13 @@ thử nhiều client, chưa đo lại roaming sau rebase.
   khác dùng thì nên đưa ra repo riêng, và README đang là tiếng Anh + một mục "dùng nhanh" tiếng Việt.
 - ~~Mục 8: vì sao hạ pool xuống 2048 làm cạn~~ — xong, xem cuối mục 8: 2048 = `n2h_low_water_core0`.
 - ~~Mục 16: gửi patch 714 lên openwrt/openwrt~~ — xong: PR #26511, CI 3/3 pass, mô tả đã sửa
-  theo số đo ở đính chính lần hai. Còn lại: theo phản hồi reviewer, nhờ người có Redmi AX5400 /
+  theo số đo ở mục 26. Còn lại: theo phản hồi reviewer, nhờ người có Redmi AX5400 /
   PZ-L8 kiểm chứng, và gửi bản `[PATCH net-next]` lên netdev. PR bỏ hook vào
-  kuncy7/openwrt-nss-edma **hoãn** tới khi patch vào được `c3po-tag-8021q`.
+  kuncy7/openwrt-nss-edma **không còn cần**: thượng nguồn tự xoá file hook ngày 2026-11-07
+  khi tắt port 5 (xem mục 26), và commit bỏ hook của mình bị drop khi rebase. Nhưng patch 714
+  cũng thành no-op trên CR880x từ đó — cần chuẩn bị câu trả lời "sao không tắt port đi" cho
+  reviewer, và chỗ còn minh hoạ được vấn đề giờ chỉ còn AX5400 / PZ-L8 (wan ở eth0, không tắt
+  port 5 được).
 - 999-998: **đã bỏ 2026-11-07** (mục 23; cặp thêm-rồi-revert bị xoá khi dọn lịch sử cho release,
   xem mục 25 — `main` giờ đơn giản là không có nó). Phần đo
   RAM ở **mục 20** vẫn đúng (4,01 MiB cho cả hai radio) — chỉ là cái giá 4 MiB đó không mua được
@@ -1869,8 +2736,10 @@ thử nhiều client, chưa đo lại roaming sau rebase.
   20 KiB, không hỏng gì (không có `BPF_JIT_ALWAYS_ON`, và board này không chạy BPF nào khác).
   Còn lại: config đó dùng chung cho mọi board ipq50xx nên **phải hỏi upstream** trước khi đề
   nghị tắt mặc định; chuyện riêng của mình thì cứ giữ trong fork.
-- Mục 18: mở PR nhánh `nss-tools-fw-mask` vào `main` của fork, và build một ảnh mang bản sửa
-  (chỉ cần trước lần flash kế tiếp — hai máy đang có override `0x3` nên hành vi y hệt).
+- ~~Mục 18: mở PR nhánh `nss-tools-fw-mask` vào `main` của fork, và build một ảnh mang bản sửa~~ —
+  xong 2026-11-08: cherry-pick thẳng vào `main` (`c20f4b39d1`, kèm `tests/dsa-fw-mask.test.py` 5/5
+  và một job CI), có trong release 2026.11.08, và là commit 3 của PR 68 gửi kuncy7 (nó cũng sửa
+  cho PZ-L8, Cudy P5, Redmi AX5400 — ba board có `wan` ở `eth0`).
 - **Vòng 2 (việc lớn còn lại)**: giải phóng page pool RX của stmmac khi NSS claim GMAC, cấp lại
   khi release (mục 9, trên nền patch 0956). Không còn là phỏng đoán nữa — mục 20 đo được đúng
   **4,00 MiB**, hai stack mỗi stack 2,00 MiB (512 trang), một qua `stmmac_open`, một qua
