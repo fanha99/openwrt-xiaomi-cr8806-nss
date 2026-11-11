@@ -3,7 +3,8 @@
 Branch `notes` chỉ chứa ghi chép, không chứa cây OpenWrt:
 - `NOTES.md` (file này): các thử nghiệm RAM và Wi-Fi trên CR8806.
 - `pr45-followup.md`: các bước test cho review PR 45 (tiếng Anh).
-- `tools/`: script đo dùng trong hai file trên, và `tools/hzyitc2nss/` (converter cấu hình
+- `tools/`: script đo dùng trong hai file trên, `tools/publish-packages.sh` (dàn kho package cho
+  release, xem mục 27), và `tools/hzyitc2nss/` (converter cấu hình
   hzyitc -> bản DSA/NSS, xem mục 17).
 
 Mỗi thử nghiệm một mục: sửa gì, vì sao, đo thế nào, kết quả. Code nằm ở các branch của
@@ -2645,7 +2646,172 @@ trở lên, "no need to hold anything for it".
 - Ba comment còn lại — kuncy7 issue 53, `openwrt/openwrt` issue 26157, `openwrt/openwrt` PR 26511 —
   đã viết gọn lại, **chưa gửi**.
 
+## 27. Kho package riêng cho release: vì sao `apk update` lỗi, và vì sao dòng feed của thượng nguồn là nguy hiểm
+
+Ngày 2026-11-11, thử `apk update` trên router (bản `cr8806-nss-2026.11.10`, `r38517-14875f61c8`):
+
+```
+1 unavailable, 0 stale; 10169 distinct packages available
+ERROR: wget: exited with error 8
+WARNING: updating and opening .../aarch64_cortex-a53/nss/packages.adb: unexpected end of file
+The apk update command failed with code 1.
+```
+
+### Vì sao lỗi (đo được)
+
+`feeds.conf.default` của cây này pin feed `nss` vào `github.com/kuncy7/nss-packages.git`, còn
+`CONFIG_PER_FEED_REPO=y` làm `FeedSourcesAppendAPK` (`include/feeds.mk:47-62`) ghi vào image **một
+dòng cho mỗi feed đang bật**, theo khuôn `%U/packages/%A/<feed>/packages.adb`. Thượng nguồn không
+có feed nào tên `nss`, nên dòng đó 404:
+
+```
+.../aarch64_cortex-a53/nss/packages.adb   -> HTTP 404   (= wget error 8)
+.../aarch64_cortex-a53/base/packages.adb  -> HTTP 200
+```
+
+Nghĩa là **phần mềm userspace vẫn cài được ngay, không cần build gì** — con số 10169 là thật. Chỉ
+`apk update` trả exit 1 vì một feed chết.
+
+### Kernel module thì không bao giờ lấy được từ feed thượng nguồn (đo được)
+
+| | package kernel |
+|---|---|
+| snapshot thượng nguồn, ipq50xx | `kernel-6.18.60~445b517b0ed6daaa474b53dda7466054-r1` |
+| bản build ở đây | `kernel-6.18.60~e182ccbedc76165223033d451eba4327-r1` |
+
+Cùng 6.18.60, khác **hash của config + patch** (đương nhiên: cây này có NSS và các patch DSA). Mỗi
+`kmod-*` depend đúng tên-version package kernel đó, nên apk sẽ báo unsatisfiable dependency. Thêm
+nữa, kmod ipq50xx thượng nguồn build trên kernel stock không NSS.
+
+### Dòng feed thật sự nguy hiểm (suy ra, **chưa thử** — và không nên thử trên máy đang chạy)
+
+Dòng đầu tiên trong `distfeeds.list` (`include/feeds.mk:53`) là
+
+```
+https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq50xx/packages/packages.adb
+```
+
+Repo đó chứa `kernel`, `base-files` và toàn bộ `kmod-*` của bản stock — **cùng tên package, khác
+version** với những gì đang cài. Một lần `apk upgrade`, hoặc `apk add` một kmod, là apk có thể thay
+package `kernel` rồi kéo cả 64 kmod sang bản thượng nguồn; `.ko` sai vermagic thì ath11k và các
+module NSS không load được sau reboot → phải nạp lại firmware. Đây là lý do chính để đổi cách làm,
+không chỉ là chuyện 404.
+
+### Chuỗi tin cậy đã sẵn sàng (đo được)
+
+Index trong `bin/` **đã được ký** (`package/Makefile:195-201`, `--sign $(BUILD_KEY_APK_SEC)` khi
+`CONFIG_SIGNED_PACKAGES=y`), và verify được khi trong keys-dir **chỉ có** `public-key.pem`:
+
+```
+apk adbdump --keys-dir <dir chỉ có public-key.pem> bin/packages/aarch64_cortex-a53/base/packages.adb
+-> exit 0, "packages: # 86 items"
+```
+
+Mà đúng file khoá công khai đó, sha256 `2f33423181f3366d432ec1fd0a85650af4be74ab6e9c752137ff1858028864f3`,
+đã nằm trong image tại `/etc/apk/keys/public-key.pem`. Vậy **ai flash release của mình thì router đã
+tin kho package của mình**, không cần `--allow-untrusted`, không phải làm gì thêm.
+
+Hệ quả phải nhớ:
+
+- `private-key.pem` + `public-key.pem` (tạo 2026-10-24) chỉ có ở local; `.gitignore:23-25` chặn cả
+  `key-build*`. **Phải backup offline** — mất khoá riêng là mọi router đã flash không verify được
+  package mới nữa, chỉ còn đường reflash. Và nó là secret: không bao giờ push.
+- Ai tự build sẽ sinh khoá của chính họ, nên kho package phải công bố kèm **public key** để họ thêm
+  tay vào `/etc/apk/keys/` nếu muốn dùng.
+
+### Cách sửa đã chọn: `%U` trỏ về kho của mình, userspace thượng nguồn xuống `customfeeds.list`
+
+**1. `.config`** (menuconfig: Advanced configuration options → Version configuration options →
+Release repository; khai báo ở `package/base-files/image-config.in:198`):
+
+```
+CONFIG_VERSIONOPT=y
+CONFIG_VERSION_REPO="https://fanha99.github.io/cr8806-nss-packages/%R"
+CONFIG_ALL_KMODS=y            # để người dùng apk add được mọi kmod
+CONFIG_FEED_routing=m         # ba feed này không build package nào (0 apk)
+CONFIG_FEED_telephony=m       # -> m = dòng feed ghi ra dạng comment (include/feeds.mk:60)
+CONFIG_FEED_video=m
+```
+
+`%R` được thay bằng `REVISION` (`include/version.mk:103`), và `%U` được thay **trước** trong cùng
+chuỗi sed nên `%R` nằm trong URL vẫn nở ra (đọc từ `include/version.mk:96-106`, **chưa chạy thử**).
+Tức mỗi bản build tự trỏ vào thư mục package của chính nó — không phải sửa URL mỗi lần release, và
+image cũ vẫn dùng được kho cũ. **Đừng xoá các thư mục revision cũ trên site.** Feed `nss` giữ `y`
+vì giờ chính mình host nó → hết 404.
+
+**2. `package/system/apk/files/customfeeds.list`** — file 3 dòng, là **conffile** của package apk
+(`package/system/apk/Makefile:74-76`, cài vào `/etc/apk/repositories.d/customfeeds.list`), nên sống
+qua sysupgrade và người dùng sửa được. Thêm userspace thượng nguồn:
+
+```
+# Upstream OpenWrt snapshots: userspace only. Do NOT add
+# targets/.../packages here: its kernel/kmod packages are built
+# against a different kernel config and will break NSS.
+# Use `apk add`, not `apk upgrade`.
+https://downloads.openwrt.org/snapshots/packages/aarch64_cortex-a53/base/packages.adb
+https://downloads.openwrt.org/snapshots/packages/aarch64_cortex-a53/packages/packages.adb
+https://downloads.openwrt.org/snapshots/packages/aarch64_cortex-a53/luci/packages.adb
+https://downloads.openwrt.org/snapshots/packages/aarch64_cortex-a53/routing/packages.adb
+https://downloads.openwrt.org/snapshots/packages/aarch64_cortex-a53/telephony/packages.adb
+https://downloads.openwrt.org/snapshots/packages/aarch64_cortex-a53/video/packages.adb
+```
+
+Mấy feed arch này **không** chứa `kernel`, `base-files` hay `kmod-*` — những thứ đó nằm ở
+`targets/%S/packages` (kiểm trong `bin/` của mình: `base-files-1727~14875f61c8.apk` và
+`kernel-...apk` đều ở `bin/targets/qualcommax/ipq50xx/packages/`, còn
+`bin/packages/aarch64_cortex-a53/base/` là 86 package userspace). Nên an toàn, và đủ 10169 package
+để `apk add htop`, `luci-app-*`...
+
+Đánh đổi còn lại: base của mình (pinned) và base thượng nguồn (rebuild hàng ngày) cùng tên package
+khác version → `apk upgrade` sẽ kéo thư viện nền mới hơn về. Khuyến nghị trong release notes:
+**chỉ `apk add`, đừng `apk upgrade`**.
+
+**3. Kho host.** GitHub Pages, repo riêng `fanha99/cr8806-nss-packages`, layout y như OpenWrt
+(`<rev>/targets/qualcommax/ipq50xx/packages/` + `<rev>/packages/aarch64_cortex-a53/{base,luci,packages,nss}/`).
+Script dàn file: `tools/publish-packages.sh` của branch này — chỉ copy `*.apk` + `packages.adb` +
+`index.json`, **không bao giờ copy image hay khoá riêng** (có check chặn file lạ), và chép
+`public-key.pem` ra `cr8806-nss-public-key.pem`. Không chạy git. Chạy thử 2026-11-11 trên
+`r38517-14875f61c8`:
+
+```
+targets/qualcommax/ipq50xx/packages: 91
+packages/aarch64_cortex-a53/{base,luci,packages,nss}: 86 / 19 / 5 / 3
+total: 204 packages, 15M
+```
+
+Dung lượng hiện tại 15 MB (đo); bật `ALL_KMODS` thì **ước** 60-100 MB — vẫn thoải mái so với hạn
+mức ~1 GB của Pages (số hạn mức là nhớ từ tài liệu GitHub, chưa kiểm lại).
+
+**Đừng dùng release asset thay Pages**: GitHub đổi ký tự lạ trong tên asset, mà tên package có `~`
+(`kernel-6.18.60~e182…`), apk sẽ dựng URL sai và 404. (Suy ra từ cách GitHub đặt tên asset, chưa
+kiểm bằng một lần upload thật.)
+
+### Còn "cập nhật firmware" thì sao
+
+`owut` / attended-sysupgrade cần một ASU server riêng (nó hỏi server build ảnh theo danh sách
+package đang cài) — không đáng dựng cho một fork một board. Với dual-boot CR8806 thì cách gọn nhất
+vẫn là release notes + `sysupgrade` giữ config vào slot **không** chạy, đúng quy trình đang dùng.
+
+### Trạng thái và quyết định (2026-11-11)
+
+- **Chưa sửa gì.** `.config` hiện tại: `CONFIG_VERSIONOPT` chưa bật, `VERSION_REPO` mặc định
+  (`https://downloads.openwrt.org/snapshots`), `ALL_KMODS` chưa bật, cả 6 feed đều `y`.
+- `~/nss-build/openwrt-nss` (branch `main`, `14875f61c8`) vẫn còn **hai file patch 714/784 sửa
+  warning chưa commit** (xem mục 26) — cố ý để nguyên.
+- **Quyết định**: đợi kuncy7 merge PR 68 rồi làm **cùng một lượt** — commit bản sửa warning lên
+  `main`, bật 3 thay đổi ở trên, build lại một bản release (có `ALL_KMODS`), dàn kho package và
+  push Pages. Làm sớm hơn thì phải build lại lần nữa sau khi merge.
+
 ## Việc còn lại
+
+- **Kho package riêng cho release** (mục 27): đợi kuncy7 merge PR 68 rồi làm **một lượt** — commit
+  bản sửa warning của 714/784 lên `main`, bật `CONFIG_VERSIONOPT` +
+  `CONFIG_VERSION_REPO="https://fanha99.github.io/cr8806-nss-packages/%R"` + `CONFIG_ALL_KMODS`, đặt
+  `CONFIG_FEED_{routing,telephony,video}=m`, thêm 6 dòng userspace thượng nguồn vào
+  `package/system/apk/files/customfeeds.list`, build lại release, rồi `tools/publish-packages.sh`
+  và push Pages. Lý do không chỉ là tiện: dòng `targets/.../packages` của thượng nguồn trong
+  `distfeeds.list` có thể làm `apk` thay package `kernel` và kéo 64 kmod sai vermagic về. **Chưa
+  làm gì** tính đến 2026-11-11.
 
 - ~~**Kiểm ảnh từ `f3588d3871` trở lên cho kuncy7**~~ — **xong 2026-11-07/08**, xem mục 26.
   LAN/WAN thông, routed đạt line rate một chiều (932 Mbit/s), NSS offload còn nguyên, softirq
