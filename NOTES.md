@@ -2915,6 +2915,83 @@ kèm đính chính chuyện `netdev_uses_dsa`.
 3. **Patch gửi openwrt phải ở dạng refresh**, nếu không CI đỏ hết mọi target — và đó là một
    nguyên nhân duy nhất, đừng đọc thành "nhiều lỗi".
 
+### Thread netdev: "sửa ở đâu" — và nó nói gì về 714
+
+Đọc được nhờ bạn lưu trang về `f:\html\` (lore.kernel.org trả 403 cho fetch tự động). Thread là
+`[PATCH net-next v9 08/11] net: dsa: realtek: rtl8365mb: re-latch the family D SerDes` của
+namiltd; ba message đáng kể:
+
+**Johan Alvarado (= c127dev, tác giả PR openwrt 26597), 2026-11-10 00:49 EST.** Đo trên Mercusys
+MR80X v2 (IPQ5018 + RTL8367S family C, CPU port 2500base-x, NAND, reboot loop), **cùng một bản
+rtl8365mb cho cả bốn**:
+
+| stack | boot lỗi |
+|---|---|
+| OpenWrt 6.18 (stmmac dwmac-ipq5018 + qca-uniphy PCS) | **18 / 51** |
+| stack cũ qca-nss-dp + qca-ssdk (6.12) | 0 / 16 |
+| 6.18 + patch thứ tự **phía switch** (bản của kuncy7, openwrt PR 25153) | 0 / 16 |
+| 6.18 + UNIPHY mode sequence dời vào **GMAC probe**, không sửa switch | 0 / 32 |
+
+Cơ chế: bootloader trao UNIPHY ở SGMII 1.25G; `qca-uniphy` chỉ program từ `pcs_config()`, mà cái
+đó chạy ở **lần `ndo_open` đầu tiên của conduit**; switch dựng SerDes ở HSGMII lúc DSA setup, sớm
+hơn ~2 s, nên receiver của nó train vào line rate sai. Bằng chứng chỗ kẹt là **receiver của
+switch**: boot lỗi thì re-sequence UNIPHY không cứu được, unbind/bind driver switch thì cứu 100%;
+dựng SerDes switch khi UNIPHY đã program sẵn thì 21/21 tốt. Kết luận của anh ấy: *"far end not up
+yet"* thực ra là *"far end up at the wrong line rate"*.
+
+Câu quan trọng nhất cho mình:
+
+> *"Neither dwmac-ipq5018 nor pcs-qca-uniphy is in mainline, so none of this can be reproduced on
+> a mainline kernel. That's why I'd rather not have the workqueue, the extra locks and the reboot
+> notifier in rtl8365mb for it."*
+
+**Alvin Šipraga (maintainer rtl8365mb), 2026-11-10 10:33 CET**: *"I guess if this can be fixed on
+the SoC side …, then we can drop this patch from the series altogether. Correct?"*
+**namiltd**: *"Yes… I will drop this patch from the upcoming v10 version of the series."*
+
+Tức nguyên tắc hiện ra ở đây là: **sửa ở tầng sở hữu cái đầu đang sai, và đừng nhét workaround vào
+code mainline cho lỗi chỉ tái hiện được với driver ngoài mainline.** 714 là thay đổi trong **lõi
+DSA mainline**, và conduit của mọi board nó phục vụ là `dwmac-ipq5018` — ngoài mainline. Câu hỏi
+sẽ gặp ở netdev gần như chắc chắn là *"sao không sửa trong driver conduit?"*. (Lưu ý: **không ai
+trong thread bàn về việc DSA tự `dev_open()` conduit** — suy luận trước đó của tôi rằng netdev đã
+bác cách đó là **sai**, thread không nói gì về nó.)
+
+**Phản chứng, đo được** — quét toàn bộ DT in-tree của mainline 6.18.60, đi từng node port:
+
+```
+arm64: 32 port có 'ethernet = <>'  → 0 có phy-handle và không fixed-link
+arm  : 79                          → 3
+mips :  3                          → 0
+```
+
+Ba board là **Barco/GE imx6q-b450v3 / b650v3 / b850v3**, và cả hai đầu đều là driver **mainline**:
+
+```
+switch   : compatible = "marvell,mv88e6085"  (88E6240)
+cpu port : port@4 { label="cpu"; ethernet=<&switch_nic>; phy-handle=<&switchphy4>; }  ← không fixed-link
+conduit  : switch_nic = ethernet@4,0  compatible="pci8086,1533"  (Intel I210, driver igb)
+```
+
+Nên hình dạng DT mà 714 nhắm tới **có thật trong mainline**, không phải thứ chỉ tồn tại ở OpenWrt —
+đó là lập luận phải đưa vào cover letter khi gửi netdev. Giới hạn phải nói thẳng: chưa chứng minh
+ba board đó thật sự hỏng (không có máy, và 13 s xoá quảng bá 1000BASE-T là đặc tính QCA8337 PHY4);
+chỉ chứng minh được hình dạng DT tồn tại, và pattern "PHY của conduit chỉ attach/power-up khi
+`ndo_open`" cũng là hành vi mainline (`stmmac_init_phy()` gọi từ `stmmac_open()`; igb
+`igb_power_up_link()` ở open, power-down ở close).
+
+Hệ quả cho các việc đang treo:
+
+- **PR 26511 (openwrt) không bị ảnh hưởng** — OpenWrt chính là nơi 4 board kia được build.
+- **Gửi netdev thì phải chuẩn bị trả lời "sao không sửa trong driver conduit"**: ba board mainline
+  ở trên, cộng lập luận một fix per-driver là N lần sửa cho N driver trong khi DSA là chỗ duy nhất
+  biết topology, và patch đã tự giới hạn bằng hình dạng DT (`phy-handle`, không `fixed-link`).
+- **PR 25153 của kuncy7 có thể thành không cần thiết** nếu 26597 land: số đo của Johan cho thấy cả
+  hai cách đều 0 lỗi, và netdev đã bỏ patch phía switch. kuncy7 có trong Cc của thread nên chắc đã
+  biết.
+- Đề nghị "gộp ba patch thành một PR" của namiltd: sau khi patch 8 bị bỏ khỏi v10, hai thứ còn
+  chồng nhau là **25153 (phía switch) và 26597 (phía SoC)** — đó mới là cặp nên thống nhất, 714
+  không thuộc nhóm đó (bảng gmac0/gmac1 ở trên là bằng chứng).
+
 ### 784 thì gửi đâu
 
 Quyết định: **gửi netdev, không mở PR openwrt.** 784 chỉ đổi hành vi khi một switch dùng tagger
