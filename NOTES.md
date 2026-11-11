@@ -2802,16 +2802,196 @@ vẫn là release notes + `sysupgrade` giữ config vào slot **không** chạy,
   `main`, bật 3 thay đổi ở trên, build lại một bản release (có `ALL_KMODS`), dàn kho package và
   push Pages. Làm sớm hơn thì phải build lại lần nữa sau khi merge.
 
+## 28. Thượng nguồn nhận series, dựng lại `main`, và dựng kho package thật
+
+Ngày 2026-11-11, sau khi sửa hai warning của kuncy7 (mục 26) và force push PR 68.
+
+### kuncy7 nhận series, nhưng không bằng nút merge
+
+Anh ấy **rebase cả 5 commit** của PR 68 lên `c3po-tag-8021q` thành `011b87e0ae`..`4d73bf55e2` rồi
+đóng PR bằng tay, lý do: GitHub từ chối nút merge vì series có chạm `.github/workflows/`. Kiểm
+bằng diff chứ không tin lời: `git diff c13dd991dc origin/c3po-tag-8021q` chỉ còn **4 commit riêng
+của anh ấy** (CI cache, stmmac drop-TX, ath11k tx-rate, TP-Link U-Boot), tức 5 commit của mình vào
+**nguyên vẹn, kèm cả hai bản sửa warning**, author giữ `Fanha Giang`, committer là Stanislaw Pal.
+
+Anh ấy cũng trả lời chuyện RT-AX89X: tree này chỉ build ipq50xx nên không đổi ảnh nào được phát
+hành, nhưng với `openwrt/openwrt#26511` — nơi RT-AX89X **được** build — thì nên thêm guard.
+
+### Dựng lại `main`: 14 commit còn 7
+
+Nền mới `4d73bf55e2`, bỏ 5 commit đã lên thượng nguồn. Hai việc phát sinh:
+
+- **Đổi số patch stmmac của mình: `0958b` → `0958c`.** Thượng nguồn vừa thêm
+  `0958b-net-stmmac-drop-host-TX-in-flight…`, trùng số với
+  `0958b-net-stmmac-give-the-host-RX-buffers-back…` của mình, và cả hai sửa `stmmac_main.c` quanh
+  dòng 2410-2440. Sau khi đổi tên thì thứ tự áp đúng (drop-TX trước), nhưng build vẫn báo
+  **`Hunk #4 succeeded at 2473 with fuzz 1`** — patch mới chèn 17 dòng vào đúng vùng context của
+  hunk #4. Fuzz thì áp được nhưng không được phép có trong một bản release, nên chạy
+  `make target/linux/refresh`, giữ **đúng một file** của mình và `git checkout` lại 26 file còn
+  lại — hoá ra cây kuncy7 có **27 patch chưa ở dạng refresh**, refresh sẽ viết lại hết. Context
+  cuối hunk #4 đổi từ *"The firmware enables the DMA interrupts for itself…"* sang *"Frames the
+  host queued just before the stop never complete now…"*, các hunk sau dịch 2453→2470, 2486→2551.
+  Build lại: **fuzz 0**.
+- **Pin feed nss nhảy `4fa071ab14` → `c94a78031d`**: "qca-nss-drv: reset truesize when reusing a
+  tx skb as a receive buffer", bản sửa issue #54 — `nss_skb_reuse()` giữ truesize của kiếp trước
+  của skb, với fraglist GRO thì nó dồn tới 2^31 làm UDP socket chết (`udp_prod_queue` kẹt ở
+  0x80000000) và IPv4 reassembly tắc ở 2^32. Ảnh này tắt fraglist GRO nên chưa bao giờ gặp.
+  Kiểm patch có vào thật bằng log build (`CONFIG_AUTOREMOVE=y` xoá source sau khi build nên
+  không soi được build_dir): `Applying …/0150-nss_core-reset-truesize….patch` → `patching file
+  nss_core.c`, không lỗi.
+
+`.config` thêm đúng 4 nhóm: `IMAGEOPT`+`VERSIONOPT`, `VERSION_REPO`, ba feed rỗng thành `m`, và
+**tắt** `VERSION_FILENAMES`/`VERSION_CODE_FILENAMES` — hai cái này default `y` khi bật VERSIONOPT,
+để nguyên thì tên ảnh thành `openwrt-SNAPSHOT-r38522-…`, khác mọi release trước.
+
+### Kho package: làm thật theo kế hoạch mục 27
+
+Repo `fanha99/cr8806-nss-packages` + GitHub Pages, một thư mục cho mỗi revision.
+`tools/publish-packages.sh` dàn file, `index.html` để root không 404.
+
+**Đính chính một phép thử sai của chính mình**: mục 27 nói "index verify được khi chỉ có
+`public-key.pem`" dựa trên `apk adbdump --keys-dir …` → **sai**, `adbdump` không verify gì cả
+(keys-dir rỗng vẫn exit 0). Phép thử đúng là nạp repo bằng `apk list`:
+
+```
+apk list --root <root rỗng> --keys-dir <chỉ public-key.pem> --repositories-file <URL Pages>
+  -> liệt kê đủ 91 package
+cùng lệnh, keys-dir rỗng
+  -> WARNING: fetching …/packages.adb: UNTRUSTED signature
+```
+
+Và tên package có `~` (`kernel-6.18.60~e182ccbe…-r1.apk`) Pages phục vụ bình thường, HTTP 200 —
+đây là lý do mục 27 nói đừng dùng release asset (GitHub đổi ký tự trong tên asset).
+
+`distfeeds.list` trong rootfs đã build: 5 URL của revision này, 3 feed rỗng bị comment, **không
+còn dòng `targets/.../packages` của thượng nguồn** — tức cái bẫy kernel/kmod lệch vermagic ở mục
+27 đã bị cắt từ gốc. `customfeeds.list`: 6 feed userspace.
+
+### `openwrt/openwrt#26511`: vì sao CI đỏ hết, và guard đúng là gì
+
+CI đỏ **toàn bộ** job, nhưng chỉ một nguyên nhân: step `Validate Refreshed Kernel Patches` —
+patch chưa ở dạng refresh, mà patch nằm trong `generic/pending-6.18` nên mọi target build kernel
+6.18 đều báo cây bẩn. Tái hiện bằng cách rebase nhánh lên main hiện tại rồi
+`make target/linux/refresh`: nó viết lại đúng hai dòng hunk header
+
+```
+-@@ -1870,6 +1870,41 @@
++@@ -1881,6 +1881,46 @@ static void dsa_shared_port_link_down(st
+```
+
+(lệch 11 dòng vì `net/dsa/port.c` của main đã dịch, cộng tên hàm mà `QUILT_DIFF_OPTS="-p"` thêm
+vào). Refresh cả series thì **không file nào khác đổi** — khác hẳn cây kuncy7.
+
+**Guard mà mình đề xuất là sai, và kuncy7 đã đồng ý với nó.** `netdev_uses_dsa(dev)` là
+`dev->dsa_ptr && dev->dsa_ptr->rcv` — **đúng với mọi conduit**, không phải "conduit là user port
+của switch khác"; và ở thời điểm `dsa_shared_port_link_register_of()` thì chưa conduit nào có
+`dsa_ptr`. Predicate đúng là `dsa_user_dev_check()`, chính cái DSA tự dùng để nhận switch xếp
+tầng (`net/dsa/dsa.c:1145`, trong `dsa_get_tag_protocol()`). Đã sửa thành:
+
+```c
+if (!dp->conduit || dsa_user_dev_check(dp->conduit) ||
+    of_phy_is_fixed_link(dp->dn))
+	return;
+```
+
+Quét lại DTS của **openwrt main** (đi từng node, không grep bừa): sau khi có guard, patch còn tác
+dụng với **4 board** — CMCC PZ-L8, Redmi AX5400, JDCloud AX6000, SPNMX56 — và RT-AX89X bị loại.
+Hai board của PR 25153 (Archer AX55 v1, Mercusys MR80X v2) dùng `fixed-link` nên vốn đã return
+sớm. Force push `ebf3830c11` → `692d005b51`; CI sau đó ở trạng thái `action_required` (PR từ fork
+cần maintainer approve lại sau mỗi push).
+
+Hệ quả: 714 ở hai cây **không còn giống nhau** — bản kuncy7 không có guard, bản openwrt có. Đó là
+chủ ý của anh ấy, nhưng nên gửi anh ấy một PR nhỏ thêm guard để hai cây mang cùng một đoạn code,
+kèm đính chính chuyện `netdev_uses_dsa`.
+
+### Ba bài học về patch, cùng một gốc
+
+1. **Đừng sửa tay hunk.** Lần này thử thêm 6 dòng vào thân hunk mà không sửa số đếm ở header →
+   `patch: **** malformed patch at line 72`. Cách đúng: sửa trong source rồi `quilt refresh` với
+   đúng tham số OpenWrt dùng (`QUILT_DIFF_OPTS="-p" quilt refresh -p ab --no-index --no-timestamps`,
+   xem `include/quilt.mk:168`).
+2. **`quilt edit` treo** vì nó gọi `$EDITOR`, không có thì gọi `vi` — job nền đứng 15 phút không ai
+   biết. Sửa file bằng script rồi `quilt refresh`, không dùng `quilt edit`.
+3. **Patch gửi openwrt phải ở dạng refresh**, nếu không CI đỏ hết mọi target — và đó là một
+   nguyên nhân duy nhất, đừng đọc thành "nhiều lỗi".
+
+### 784 thì gửi đâu
+
+Quyết định: **gửi netdev, không mở PR openwrt.** 784 chỉ đổi hành vi khi một switch dùng tagger
+tag_8021q có **từ 2 CPU port**. Quét cây openwrt main:
+
+| driver dùng tag_8021q | board | số CPU port |
+|---|---|---|
+| an8855 | 5 board mediatek | 1 (hai node switch của hai biến thể, mỗi node 1 CPU port) |
+| rtl8365mb | 6 board | 1 |
+| mxl862xx | 1 board | 1 |
+| sja1105 / felix / vsc73xx | không có board | — |
+
+Và tagger `qca-8021q` làm CR880x gặp bug là của kuncy7, **không có trong openwrt**. Nên ở openwrt
+patch này là code chết, reviewer sẽ hỏi ngay "board nào cần". netdev là chỗ đúng: bug lõi DSA,
+đọc code là review được, và nếu nhận thì openwrt tự có khi bump kernel. 714 thì khác — nó có 4
+board thật trong cây.
+
+### Nạp lên Home1 và test sơ (2026-11-11 18:14)
+
+Nạp `sysupgrade.bin` của `r38522-83b63e1b91` vào **slot 1** (máy đang chạy slot 0 với
+2026.11.10 — ghi chú cũ nói slot 0 là 2026.11.08 nên đã sai, phải đọc máy mới biết). Config mang
+sang bằng `sysupgrade -b` → `sysupgrade.tgz`. Backup trước khi nạp:
+`~/nss-build/private-backups/home1-20261111-1813-pre-slot1.tar.gz`. Lên lại sau **30 s**.
+
+| kiểm | kết quả |
+|---|---|
+| boot | đủ VLAN 68/6/7, 3 SSID, địa chỉ và khoá còn nguyên |
+| chia conduit | `wan` trên `eth0` (`vid=3076 phys_if=0`), `lan1-3` trên `eth1` (`vid=6/7/68 phys_if=1`) |
+| GMAC | cả hai `started`, `fw_link=up`, `fw_mask 0x3` |
+| link | CPU port của switch lên 1Gbps/Full ở **2,039 s** (2026.11.10 đo được 4,634 s cho eth0); eth0 và eth1 đều 1000Mb/s Full |
+| NSS | `NSS 256 MiB: active` cả hai radio, `nss_offload=1`, ECM accelerate 43 → 78 flow |
+| station | 480 Mbit/s HE-MCS 9 và 433 Mbit/s VHT-MCS 9, cái thứ hai **idle 1,7 s mà vẫn 433** — đúng cái bản sửa ath11k nhắm tới, nhưng đây không phải A/B với bản cũ |
+| RAM | MemAvailable 40-44 MB (có LuCI) |
+| lỗi | `dropped frame` 0, không TX timeout, không reset adapter (5 dòng "watchdog" trong dmesg đều là RX mitigation timer và procd, vô hại) |
+
+**Kho package, test từ chính router** — đây là thứ chưa từng chạy trên máy thật:
+
+```
+apk update  -> exit 0, "OK: 9988 distinct packages available", không còn 404
+apk add htop            (feed userspace thượng nguồn)  -> cài được, htop 3.5.3 chạy, rồi apk del
+apk add sqm-scripts-nss (feed nss, chỉ tồn tại ở kho của mình) -> cài được, chữ ký verify, không cần --allow-untrusted
+```
+
+Tức chuỗi tin cậy chạy thật trên thiết bị: `/etc/apk/keys/public-key.pem` trong ảnh tin kho
+Pages, không phải chỉ đúng trên PC.
+
+**Hai sai sót của mình trong lúc test, ghi lại để không lặp:**
+
+1. `apk add sqm-scripts-nss` rồi `apk del sqm-scripts-nss sqm-scripts` — nhưng gói đó **đã có
+   trong ảnh**, nên `add` là no-op và `del` đã **xoá hai gói của ảnh** (190 → 188). Đã cài lại
+   ngay, về 190, nhưng giờ hai gói đó nằm ở overlay (240 KB) chứ không còn trong squashfs
+   read-only. Bài học: trước khi `apk del` trong một phép thử, kiểm `[installed]` xem gói có sẵn
+   trong ảnh hay không.
+2. Một phép thử trước đó dùng `apk adbdump` để "verify chữ ký" — nó không verify gì cả (xem phần
+   đính chính ở trên).
+
+Đường về: `fw_setenv flag_last_success 0; fw_setenv flag_boot_rootfs 0; reboot` → slot 0 với
+2026.11.10 còn nguyên config.
+
+### Chưa test
+
+- Thông lượng: cổng WAN của máy này **không cắm dây**, nên đường routed hai conduit không được
+  chạy qua. Số của 2026.11.08 vẫn là số tham chiếu (927-929 Mbit/s một conduit, 1104-1458 hai
+  conduit).
+- Soak dài, và chính hai thứ mà bản sửa truesize của NSS và bản drop-TX của stmmac nhắm tới —
+  không có gì trong phép thử này tái hiện chúng.
+
 ## Việc còn lại
 
-- **Kho package riêng cho release** (mục 27): đợi kuncy7 merge PR 68 rồi làm **một lượt** — commit
-  bản sửa warning của 714/784 lên `main`, bật `CONFIG_VERSIONOPT` +
-  `CONFIG_VERSION_REPO="https://fanha99.github.io/cr8806-nss-packages/%R"` + `CONFIG_ALL_KMODS`, đặt
-  `CONFIG_FEED_{routing,telephony,video}=m`, thêm 6 dòng userspace thượng nguồn vào
-  `package/system/apk/files/customfeeds.list`, build lại release, rồi `tools/publish-packages.sh`
-  và push Pages. Lý do không chỉ là tiện: dòng `targets/.../packages` của thượng nguồn trong
-  `distfeeds.list` có thể làm `apk` thay package `kernel` và kéo 64 kmod sai vermagic về. **Chưa
-  làm gì** tính đến 2026-11-11.
+- ~~**Kho package riêng cho release**~~ (mục 27) — **xong 2026-11-11**, xem mục 28: kuncy7 đã lấy
+  cả series, `main` dựng lại còn 7 commit (`83b63e1b91`), kho
+  `fanha99/cr8806-nss-packages` chạy trên GitHub Pages và `apk add` đã test **từ chính router**.
+  **Còn lại**: (a) push tag + tạo release `cr8806-nss-2026.11.11` và đăng comment
+  `openwrt/openwrt#26511` — cả hai đã soạn, chờ chốt; (b) gửi kuncy7 một PR nhỏ thêm guard
+  `dsa_user_dev_check()` để 714 ở hai cây giống nhau, kèm đính chính `netdev_uses_dsa()`;
+  (c) gửi 784 lên netdev; (d) báo kuncy7 lỗi `printf: %l` ở `nss-status.test.sh:388` (suite PASS
+  hết case nhưng exit 2 dưới dash); (e) khi nào tin bản mới thì nạp luôn slot 0.
 
 - ~~**Kiểm ảnh từ `f3588d3871` trở lên cho kuncy7**~~ — **xong 2026-11-07/08**, xem mục 26.
   LAN/WAN thông, routed đạt line rate một chiều (932 Mbit/s), NSS offload còn nguyên, softirq
